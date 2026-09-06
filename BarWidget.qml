@@ -17,6 +17,11 @@ Panel {
     property bool isRestoring: false
     property string lastAction: ""
     property string profileDir: Quickshell.env("HOME") + "/.config/omarchy/workspace-restorer"
+    // Path to the hardened profile store helper. All profile-dir reads and
+    // writes go through it (never a shell `ls`/`cat`/`rm` on user paths); it
+    // no-follow-opens, fstats for regular/user-owned files, bounds sizes and
+    // cardinality, and routes save payloads over stdin (no temp files).
+    readonly property string storeScript: Qt.resolvedUrl("scripts/profile_store.py").toString().replace(/^file:\/\//, "")
     property var pendingSnapshot: null
     property bool showingNameInput: false
     property var monitorMap: ({})
@@ -34,16 +39,23 @@ Panel {
 
     Component.onCompleted: {
         ensureProfileDir()
-        refreshProfiles()
         buildMonitorMap()
     }
 
-    // Guarantee the profile directory exists before any save/read. Without
-    // this, a fresh install's first save silently fails because the parent
-    // directory doesn't exist yet.
+    // Guarantee the profile directory exists before any save/read. Uses the
+    // store helper (not a shell mkdir) so the directory is created 0700 and
+    // re-lstat-checked; the profile listing is chained onto its success so the
+    // first load never races the directory creation.
     function ensureProfileDir() {
-        Quickshell.execDetached(["bash", "-lc",
-            "mkdir -p " + Util.shellQuote(root.profileDir)])
+        initProc.command = ["python3", root.storeScript, "init", root.profileDir]
+        initProc.running = true
+    }
+
+    Process {
+        id: initProc
+        onExited: function(exitCode) {
+            if (exitCode === 0) root.refreshProfiles()
+        }
     }
 
     function notify(summary, body) {
@@ -65,18 +77,19 @@ Panel {
         return n
     }
 
-    // Return <name> if it resolves inside the profile directory, else null.
-    // Defense in depth on top of sanitizeProfileName so a corrupted filename
-    // can never read/write/delete outside the profile directory.
-    function validProfilePath(name) {
-        var safe = root.sanitizeProfileName(name)
-        if (safe === null) return null
-        var base = root.profileDir
-        var resolved = base + "/" + safe + ".json"
-        // After sanitizing, the only separators are the ones we add, so a
-        // simplified containment check is sufficient.
-        if (resolved.indexOf(base) !== 0) return null
-        return resolved
+    // Add a nested-cardinality guard mirroring restoreLogic.mjs. A profile is
+    // command-launch input, so window and tab counts are capped even when a
+    // profile was hand-edited; the store helper enforces the same caps, this is
+    // defense in depth on the consuming side. Returns the profile or null.
+    function enforceProfileCardinality(profile) {
+        if (!profile || typeof profile !== "object" || Array.isArray(profile)) return null
+        if (!Array.isArray(profile.windows) || profile.windows.length > 512) return null
+        for (var i = 0; i < profile.windows.length; i++) {
+            var w = profile.windows[i]
+            if (!w || typeof w !== "object" || Array.isArray(w)) return null
+            if (Array.isArray(w.tabs) && w.tabs.length > 300) return null
+        }
+        return profile
     }
 
     // Shell-quote a string so a crafted value used in generated shell code
@@ -547,8 +560,7 @@ Panel {
     // --- Profile Listing ---
 
     function refreshProfiles() {
-        listProc.command = ["bash", "-lc",
-            "ls " + Util.shellQuote(root.profileDir) + "/*.json 2>/dev/null || true"]
+        listProc.command = ["python3", root.storeScript, "list", root.profileDir]
         listProc.running = true
     }
 
@@ -557,13 +569,10 @@ Panel {
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
-                var files = text.trim().split("\n").filter(f => f.length > 0)
-                var loaded = []
-                for (var i = 0; i < files.length; i++) {
-                    var name = files[i].replace(/^.*\//, "").replace(/\.json$/, "")
-                    loaded.push(name)
-                }
-                root.profiles = loaded
+                // The helper emits bare validated names (one per line, capped
+                // at 256), so no path parsing or shell is involved.
+                var lines = text.trim().split("\n").filter(s => s.length > 0)
+                root.profiles = lines
             }
         }
     }
@@ -836,21 +845,34 @@ Panel {
 
     function doSave(name) {
         if (!root.pendingSnapshot || name.length === 0) return
-        var path = root.validProfilePath(name)
-        if (path === null) {
+        var safe = root.sanitizeProfileName(name)
+        if (safe === null) {
             root.lastAction = "Invalid profile name"
             return
         }
         var json = JSON.stringify(root.pendingSnapshot, null, 2)
-        saveProc.command = ["bash", "-lc",
-            "mkdir -p " + Util.shellQuote(root.profileDir) + " && " +
-            "cat > " + Util.shellQuote(path) + " << 'WSRESTORE'\n" + json + "\nWSRESTORE"]
+        // The store helper reads the JSON from stdin (never a temp file or a
+        // shell heredoc). payload size is bounded by the helper; enforcement
+        // of cardinality happens both here and inside the helper.
+        if (root.enforceProfileCardinality(root.pendingSnapshot) === null) {
+            root.lastAction = "Snapshot exceeded limits"
+            return
+        }
+        saveProc._json = json
+        saveProc.stdinEnabled = true
+        saveProc.command = ["python3", root.storeScript, "save", root.profileDir, safe]
         saveProc.running = true
     }
 
     Process {
         id: saveProc
+        property string _json: ""
         command: []
+        stdinEnabled: true
+        onStarted: {
+            saveProc.write(saveProc._json)
+            saveProc.stdinEnabled = false
+        }
         onExited: function(exitCode) {
             if (exitCode !== 0) {
                 // Keep pendingSnapshot so the user can retry; never report success.
@@ -870,15 +892,15 @@ Panel {
 
     function doRestore(name) {
         if (root.isRestoring) return
-        var path = root.validProfilePath(name)
-        if (path === null) {
+        var safe = root.sanitizeProfileName(name)
+        if (safe === null) {
             root.isRestoring = false
             root.lastAction = "Invalid profile name"
             return
         }
         root.isRestoring = true
         root.lastAction = "Restoring..."
-        restoreProc.command = ["bash", "-lc", "cat " + Util.shellQuote(path)]
+        restoreProc.command = ["python3", root.storeScript, "load", root.profileDir, safe]
         restoreProc.running = true
     }
 
@@ -889,7 +911,16 @@ Panel {
             waitForEnd: true
             onStreamFinished: {
                 try {
+                    // Loading runs through the store helper, which revalidates
+                    // the JSON and its cardinality (bounded, no-follow read) —
+                    // here we additionally enforce the same caps before any
+                    // launch command is generated from the content.
                     var profile = JSON.parse(text)
+                    if (root.enforceProfileCardinality(profile) === null) {
+                        root.isRestoring = false
+                        root.lastAction = "Failed to load profile"
+                        return
+                    }
                     restoreWithConflicts(profile)
                 } catch(e) {
                     root.isRestoring = false
@@ -1260,12 +1291,12 @@ Panel {
     // --- Delete ---
 
     function doDelete(name) {
-        var path = root.validProfilePath(name)
-        if (path === null) {
+        var safe = root.sanitizeProfileName(name)
+        if (safe === null) {
             root.lastAction = "Invalid profile name"
             return
         }
-        delProc.command = ["bash", "-lc", "rm -f " + Util.shellQuote(path)]
+        delProc.command = ["python3", root.storeScript, "delete", root.profileDir, safe]
         delProc.running = true
     }
 

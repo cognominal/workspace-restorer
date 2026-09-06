@@ -17,6 +17,9 @@ import {
     buildTabUrls,
     buildBrowserLaunchCommand,
     buildBrowserLaunchCommands,
+    enforceProfileCardinality,
+    MAX_WINDOWS,
+    MAX_TABS_PER_WINDOW,
 } from "../restoreLogic.mjs"
 
 const DIR = "/home/user/.config/omarchy/workspace-restorer"
@@ -314,6 +317,43 @@ test("buildBrowserLaunchCommand strips a stale --new-window tail to avoid duplic
         buildBrowserLaunchCommand(polluted, "vivaldi-stable", tabs),
         "'/opt/vivaldi/vivaldi-bin' --new-window 'https://github.com/dashboard' 'https://www.reddit.com/'"
     )
+})
+
+// --- enforceProfileCardinality ---
+
+test("enforceProfileCardinality accepts a bounded profile", () => {
+    const profile = {
+        windows: [
+            { class: "kitty", workspace: "1" },
+            { class: "firefox", workspace: "2", tabs: [{ url: "https://x.com/" }] },
+        ],
+    }
+    assert.equal(enforceProfileCardinality(profile), profile)
+    assert.equal(MAX_WINDOWS, 512)
+    assert.equal(MAX_TABS_PER_WINDOW, 300)
+})
+
+test("enforceProfileCardinality rejects non-object / missing windows", () => {
+    assert.equal(enforceProfileCardinality(null), null)
+    assert.equal(enforceProfileCardinality([]), null)
+    assert.equal(enforceProfileCardinality("x"), null)
+    assert.equal(enforceProfileCardinality({}), null)
+    assert.equal(enforceProfileCardinality({ windows: "nope" }), null)
+    assert.equal(enforceProfileCardinality({ windows: [null] }), null)
+})
+
+test("enforceProfileCardinality rejects too many windows", () => {
+    const windows = Array.from({ length: MAX_WINDOWS + 1 }, () => ({ class: "kitty" }))
+    assert.equal(enforceProfileCardinality({ windows }), null)
+    const ok = Array.from({ length: MAX_WINDOWS }, () => ({ class: "kitty" }))
+    assert.equal(enforceProfileCardinality({ windows: ok }) === null, false)
+})
+
+test("enforceProfileCardinality rejects tabs beyond the per-window cap", () => {
+    const window = Array.from({ length: MAX_TABS_PER_WINDOW }, () => ({ url: "https://x.com/" }))
+    assert.equal(enforceProfileCardinality({ windows: [{ tabs: window }] }) === null, false)
+    const over = Array.from({ length: MAX_TABS_PER_WINDOW + 1 }, () => ({ url: "https://x.com/" }))
+    assert.equal(enforceProfileCardinality({ windows: [{ tabs: over }] }), null)
 })
 
 // --- buildBrowserLaunchCommands ---

@@ -89,6 +89,28 @@ export function buildMonitorMap(monitors) {
     return map
 }
 
+// Cardinality bounds applied to any profile before it is used to generate
+// restore commands. A profile is command-launch input, so window and tab
+// counts are capped even when it was authored/edited by hand. These mirror
+// scripts/profile_store.py so save and load enforce the same limits.
+export const MAX_WINDOWS = 512
+export const MAX_TABS_PER_WINDOW = 300
+
+// Validate a parsed profile object's window/tab cardinality. Returns the
+// profile unchanged, or null if it is malformed or exceeds the bounds.
+export function enforceProfileCardinality(profile) {
+    if (!profile || typeof profile !== "object" || Array.isArray(profile)) return null
+    if (!Array.isArray(profile.windows)) return null
+    if (profile.windows.length > MAX_WINDOWS) return null
+    for (var i = 0; i < profile.windows.length; i++) {
+        var w = profile.windows[i]
+        if (!w || typeof w !== "object" || Array.isArray(w)) return null
+        if (!Array.isArray(w.tabs)) continue
+        if (w.tabs.length > MAX_TABS_PER_WINDOW) return null
+    }
+    return profile
+}
+
 // Class-name sets for browser detection. Matches Firefox-family and
 // Chromium-family browsers by their Hyprland window class.
 const FIREFOX_CLASSES = /^(firefox|librewolf|waterfox|floorp|tor-browser|zen|palemoon|seamonkey)(\.|-|$)/i

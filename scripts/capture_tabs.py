@@ -18,9 +18,10 @@ ever READS; it never starts a browser or opens a debug port itself.
 import json
 import os
 import re
-import shutil
+import stat
 import struct
 import subprocess
+import tempfile
 import sys
 
 
@@ -61,7 +62,10 @@ def _decode_mozlz4(path):
     profile directory, which is influenced by the window's own /proc command
     line, so it is treated as untrusted and bounded:
 
-      * the compressed file is stat-checked against a ceiling before any read;
+      * the compressed file is read through the held-descriptor bounded reader
+        (O_NOFOLLOW + fstat regular-file/ownership check + byte cap), never a
+        check-then-open stat->read pair, so a swapped file or a FIFO/symlink
+        cannot redirect the read or block the persistent shell;
       * Firefox recovery files lay out as the ``mozLz40\\0`` magic followed by
         an LZ4 raw block prefixed with its little-endian uncompressed size. We
         read that prefix ourselves and reject it if it exceeds a ceiling, then
@@ -69,14 +73,12 @@ def _decode_mozlz4(path):
         is a *maximum* that (as the library documents) is used in place of the
         prefix and so must not be passed for these size-prefixed blocks, but
         validating the prefix up front bounds the allocation identically;
-      * the fallback CLI's retained output is length-checked against the same
-        ceiling.
+      * the fallback CLI is fed from a private copy of the already-bounded
+        bytes (never the original path), and its retained output is read in
+        bounded chunks against the same ceiling.
     """
     try:
-        if os.stat(path).st_size > _MOZLZ4_FILE_MAX_BYTES:
-            raise ValueError("mozLz40 file exceeds size ceiling")
-        with open(path, "rb") as f:
-            data = f.read()
+        data = _read_regular_bounded(path, _MOZLZ4_FILE_MAX_BYTES)
     except OSError:
         raise
     if data[:8] != b"mozLz40\x00":
@@ -107,15 +109,45 @@ def _decode_mozlz4(path):
     except Exception:  # noqa: BLE001 - LZ4BlockError / oversized/malformed input
         raise ValueError("mozLz40 decompression failed or exceeded bounds")
 
-    # Fallback: lz4jsoncat CLI (from the lz4json package)
+    # Fallback: lz4jsoncat CLI (from the lz4json package). Feed it a private,
+    # 0600, unique temp copy of the already-bounded bytes (never the original
+    # path, so an on-disk swap between our bounded read and its read cannot
+    # redirect it) and read its output in bounded chunks so an oversized
+    # decompression cannot exhaust memory.
     lz4jsoncat = shutil.which("lz4jsoncat")
     if lz4jsoncat:
-        proc = subprocess.run(
-            [lz4jsoncat, path], capture_output=True, timeout=10
-        )
-        if proc.returncode == 0 and proc.stdout and \
-                len(proc.stdout) <= _MOZLZ4_UNCOMPRESSED_MAX_BYTES:
-            return proc.stdout
+        lz4_fd, lz4_tmp = tempfile.mkstemp(prefix="wsrestorer-lz4-")
+        try:
+            os.write(lz4_fd, data)
+            os.close(lz4_fd)
+            proc = subprocess.Popen(
+                [lz4jsoncat, lz4_tmp],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            out = b""
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > _MOZLZ4_UNCOMPRESSED_MAX_BYTES:
+                    proc.kill()
+                    raise ValueError("lz4jsoncat output exceeds size bounds")
+            try:
+                rc = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise ValueError("lz4jsoncat timed out")
+            if rc == 0 and out and len(out) <= _MOZLZ4_UNCOMPRESSED_MAX_BYTES:
+                return out
+        except OSError:
+            raise
+        finally:
+            try:
+                os.unlink(lz4_tmp)
+            except OSError:
+                pass
         raise ValueError("lz4jsoncat output absent or exceeds size bounds")
 
     raise RuntimeError("no lz4 decoder available (install python3-lz4 or lz4json)")
@@ -263,33 +295,86 @@ def capture_chromium(user_data_dir):
 _CDP_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
 _DEVTOOLS_PORT_FILE_MAX_BYTES = 4096
 # Bound on a single captured Firefox session file. The compressed mozLz40 file
-# is stat-bounded before any read, and the raw-LZ4 decompressor is given an
-# explicit uncompressed_size ceiling so a crafted tiny file can never trigger
-# an arbitrarily large allocation (raw LZ4 blocks carry no size header).
+# is byte-bounded at read time (see _read_regular_bounded below), and the
+# raw-LZ4 decompressor is given an explicit uncompressed_size ceiling so a
+# crafted tiny file can never trigger an arbitrarily large allocation (raw
+# LZ4 blocks carry no size header).
 _MOZLZ4_FILE_MAX_BYTES = 64 * 1024 * 1024
 _MOZLZ4_UNCOMPRESSED_MAX_BYTES = 256 * 1024 * 1024
+# Bound on a single Chromium Session_* SNSS file and on how many records are
+# decoded from it. The files are written by the browser itself; the caps keep a
+# huge/corrupt session from being read entirely into memory or iterated
+# without limit.
+_SNSS_MAX_BYTES = 128 * 1024 * 1024
+_SNSS_MAX_RECORDS = 65536
+
+
+def _open_regular(path, flags_extra):
+    """Open ``path`` without following symlinks and without ever blocking.
+
+    O_NONBLOCK makes a planted FIFO open return immediately instead of
+    blocking the persistent shell; the fstat in ``_require_regular`` then
+    rejects it before anything is read.
+    """
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | flags_extra
+    return os.open(path, flags, 0o600)
+
+
+def _require_regular(fd, path):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("not a regular file: %s" % path)
+    if st.st_uid != os.geteuid():
+        raise ValueError("not owned by the user: %s" % path)
+    return st
+
+
+def _read_bounded(fd, cap):
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > cap:
+            raise ValueError("file exceeds size bound")
+    return data
+
+
+def _read_regular_bounded(path, cap):
+    """Read ``path`` bounded, no-follow, and never blocking.
+
+    Reads are bounded to ``cap`` bytes so a browser-controlled or swapped file
+    can never exhaust memory, and the file must be a regular file owned by the
+    user (a FIFO/device/symlink is rejected without ever being read or waiting
+    on it).
+    """
+    fd = _open_regular(path, os.O_RDONLY)
+    try:
+        _require_regular(fd, path)
+        data = _read_bounded(fd, cap)
+    finally:
+        os.close(fd)
+    return data
 
 
 def _capture_chromium_cdp(user_data_dir):
     active_port = os.path.join(user_data_dir, "DevToolsActivePort")
-    if not os.path.isfile(active_port):
-        return None
-    if os.path.getsize(active_port) > _DEVTOOLS_PORT_FILE_MAX_BYTES:
-        return None
     try:
-        with open(active_port, "r", encoding="utf-8", errors="replace") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
-        if not lines:
-            return None
-        port = lines[0]
-        # The port is attacker-influenced (see module docstring). Constrain it
-        # to a bare 1-5 digit port number so a crafted value can never turn
-        # "http://127.0.0.1:%s/json/list" into a request to some other host
-        # (e.g. "1234@evil" would otherwise become host "evil"). We require a
-        # head-anchored match of the whole token.
-        if not _PORT_RE.match(port):
-            return None
-    except Exception:  # noqa: BLE001
+        raw = _read_regular_bounded(active_port, _DEVTOOLS_PORT_FILE_MAX_BYTES)
+    except (OSError, ValueError):
+        return None
+    text = raw.decode("utf-8", "replace")
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return None
+    port = lines[0]
+    # The port is attacker-influenced (see module docstring). Constrain it
+    # to a bare 1-5 digit port number so a crafted value can never turn
+    # "http://127.0.0.1:%s/json/list" into a request to some other host
+    # (e.g. "1234@evil" would otherwise become host "evil"). We require a
+    # head-anchored match of the whole token.
+    if not _PORT_RE.match(port):
         return None
 
     try:
@@ -314,11 +399,19 @@ def _capture_chromium_cdp(user_data_dir):
 
 
 def _iter_snss_records(path):
-    """Yield (command_id, contents) records from a Vivaldi/Chromium SNSS file."""
-    d = open(path, "rb").read()
+    """Yield (command_id, contents) records from a Vivaldi/Chromium SNSS file.
+
+    The file lives under the active browser profile directory and is treated
+    as untrusted: it is read through the held-descriptor bounded reader and
+    decoded into at most ``_SNSS_MAX_RECORDS`` records so a huge or corrupt
+    session can never be absorbed entirely into memory or iterated without
+    limit.
+    """
+    d = _read_regular_bounded(path, _SNSS_MAX_BYTES)
     if d[:4] != b"SNSS" or len(d) < 8:
         return
     off = 8
+    records = 0
     while off + 2 <= len(d):
         size = struct.unpack_from("<H", d, off)[0]
         off += 2
@@ -327,6 +420,9 @@ def _iter_snss_records(path):
         cid = d[off]
         yield cid, d[off + 1 : off + size]
         off += size
+        records += 1
+        if records >= _SNSS_MAX_RECORDS:
+            break
 
 
 def _capture_vivaldi_snss(user_data_dir):
