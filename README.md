@@ -1,7 +1,6 @@
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3N726LJT4)
 <img width="1874" height="525" alt="Workspace Restore" src="https://github.com/user-attachments/assets/59c65425-2446-405c-aaa2-2636177fa2fb" />
 
-<a href="https://paypal.me/DavidDesousa13"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40px"></a>
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3N726LJT4)
 ---
 # Workspace Restorer
 
