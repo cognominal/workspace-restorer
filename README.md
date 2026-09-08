@@ -17,11 +17,7 @@ An Omarchy shell plugin (Quickshell) for Hyprland that snapshots your window lay
 ## Installation
 
 ```bash
-# Clone the repo
-gh repo clone Davedeses/workspace-restorer ~/.config/omarchy/plugins/davedes.workspace-restorer
-
-# Or manually copy to the plugin directory
-cp -r workspace-restorer ~/.config/omarchy/plugins/davedes.workspace-restorer
+omarchy plugin add https://github.com/Davedes83/workspace-restorer.git --enable
 ```
 
 Then add the plugin to your `~/.config/omarchy/shell.json`:
@@ -42,6 +38,12 @@ Restart the shell:
 
 ```bash
 omarchy restart shell
+```
+
+## Remove
+
+```bash
+omarchy plugin remove davedes.workspace-restorer
 ```
 
 ## Usage
