@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.3] - 2026-09-11
+
+### Fix
+
+- Fixed a `NameError` in the `lz4jsoncat` fallback of `scripts/capture_tabs.py`: the `shutil` import was dropped during the 1.1.2 hardening but the fallback still calls `shutil.which()`. Restored the import so the CLI fallback works when `python3-lz4` is unavailable. (Found in marketplace security review.)
+
 ## [1.1.2] - 2026-09-06
 
 ### Hardened profile store and tab capture file reads

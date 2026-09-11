@@ -18,6 +18,7 @@ ever READS; it never starts a browser or opens a debug port itself.
 import json
 import os
 import re
+import shutil
 import stat
 import struct
 import subprocess
