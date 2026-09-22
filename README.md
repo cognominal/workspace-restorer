@@ -51,6 +51,8 @@ omarchy restart shell
 omarchy plugin remove davedes.workspace-restorer
 ```
 
+(The id stays `davedes.workspace-restorer` regardless of which fork you installed from — it's set in `manifest.json`, not tied to the GitHub repo.)
+
 ## Usage
 
 1. Click the bar widget to open the panel
