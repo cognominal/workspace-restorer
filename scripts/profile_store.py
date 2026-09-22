@@ -40,6 +40,7 @@ MAX_PROFILE_BYTES = 8 * 1024 * 1024
 MAX_WINDOWS = 512
 MAX_TABS_PER_WINDOW = 300
 MAX_PROFILES = 256
+MAX_COMMENT_LENGTH = 4000
 
 # Mirrors sanitizeProfileName in restoreLogic.mjs / BarWidget.qml.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ \-]{0,127}$")
@@ -128,6 +129,12 @@ def _validate_cardinality(obj):
             raise ValueError("window tabs must be an array")
         if len(tabs) > MAX_TABS_PER_WINDOW:
             raise ValueError("a window has too many tabs (limit %d)" % MAX_TABS_PER_WINDOW)
+    comment = obj.get("comment")
+    if comment is not None:
+        if not isinstance(comment, str):
+            raise ValueError("profile.comment must be a string")
+        if len(comment) > MAX_COMMENT_LENGTH:
+            raise ValueError("profile.comment too long (limit %d)" % MAX_COMMENT_LENGTH)
 
 
 def cmd_init():
@@ -168,11 +175,30 @@ def _list_profiles(dirname):
 
 
 def cmd_list():
+    """Emit a JSON array of {"name", "comment"} for every profile.
+
+    The comment is read from each profile file (bounded, no-follow, regular-
+    file-only - the same posture as ``cmd_load``) so the UI can show a note
+    beside each name without a second round trip per profile. A profile that
+    fails to read or parse, or whose comment isn't a plain string, simply
+    contributes an empty comment rather than breaking the whole listing.
+    """
     dirname = _check_dir_arg()
     _check_dir(dirname)
-    out = _list_profiles(dirname)
-    if out:
-        sys.stdout.write("\n".join(out) + "\n")
+    names = _list_profiles(dirname)
+    out = []
+    for name in names:
+        comment = ""
+        try:
+            path = os.path.join(dirname, name + ".json")
+            data = _read_regular_bounded(path, MAX_PROFILE_BYTES)
+            obj = json.loads(data.decode("utf-8"))
+            if isinstance(obj, dict) and isinstance(obj.get("comment"), str):
+                comment = obj["comment"][:MAX_COMMENT_LENGTH]
+        except Exception:  # noqa: BLE001 - a bad profile just lists with no comment
+            comment = ""
+        out.append({"name": name, "comment": comment})
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
 
 
 def cmd_save():

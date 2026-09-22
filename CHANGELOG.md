@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.8] - 2026-09-22
+
+### Added
+
+- Snapshots can now carry an optional multiline note, entered on the save screen below the profile name. The profile list shows a one-line preview under each name (full text on hover) so a later restore can be matched to the right snapshot.
+
 ## [1.1.7] - 2026-09-22
 
 ### Added

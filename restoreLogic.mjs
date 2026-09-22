@@ -191,6 +191,7 @@ export function groupMergeLines(addrExpr, groupId, dir, indent) {
 // scripts/profile_store.py so save and load enforce the same limits.
 export const MAX_WINDOWS = 512
 export const MAX_TABS_PER_WINDOW = 300
+export const MAX_COMMENT_LENGTH = 4000
 
 // Validate a parsed profile object's window/tab cardinality. Returns the
 // profile unchanged, or null if it is malformed or exceeds the bounds.
@@ -204,7 +205,20 @@ export function enforceProfileCardinality(profile) {
         if (!Array.isArray(w.tabs)) continue
         if (w.tabs.length > MAX_TABS_PER_WINDOW) return null
     }
+    if (typeof profile.comment === "string" && profile.comment.length > MAX_COMMENT_LENGTH) return null
     return profile
+}
+
+// Clean up a user-typed snapshot note before it's stored: normalizes line
+// endings, strips control characters (newlines/tabs excepted - it's meant to
+// stay multiline), and caps length. Mirrors MAX_COMMENT_LENGTH in
+// scripts/profile_store.py. Never null - worst case an empty string, so
+// callers can always safely call .length/.split on the result.
+export function sanitizeComment(raw) {
+    if (typeof raw !== "string") return ""
+    var v = raw.replace(/\r\n/g, "\n").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
+    if (v.length > MAX_COMMENT_LENGTH) v = v.slice(0, MAX_COMMENT_LENGTH)
+    return v
 }
 
 // Class-name sets for browser detection. Matches Firefox-family and

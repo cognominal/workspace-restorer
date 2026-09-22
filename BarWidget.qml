@@ -89,7 +89,22 @@ Panel {
             if (!w || typeof w !== "object" || Array.isArray(w)) return null
             if (Array.isArray(w.tabs) && w.tabs.length > 300) return null
         }
+        if (typeof profile.comment === "string" && profile.comment.length > root.commentMaxLength) return null
         return profile
+    }
+
+    readonly property int commentMaxLength: 4000
+
+    // Clean up a user-typed snapshot note before it's stored: normalizes line
+    // endings, strips control characters (newlines/tabs excepted - it's meant
+    // to stay multiline), and caps length. Mirrors MAX_COMMENT_LENGTH in
+    // scripts/profile_store.py. Never null - worst case an empty string, so
+    // callers can always safely call .length/.split on the result.
+    function sanitizeComment(raw) {
+        if (typeof raw !== "string") return ""
+        var v = raw.replace(/\r\n/g, "\n").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
+        if (v.length > root.commentMaxLength) v = v.slice(0, root.commentMaxLength)
+        return v
     }
 
     // Shell-quote a string so a crafted value used in generated shell code
@@ -497,58 +512,84 @@ Panel {
                 Repeater {
                     model: root.profiles
 
-                    delegate: Rectangle {
+                    // Each entry is {name, comment} (see refreshProfiles/
+                    // listProc) - comment is the optional multiline note
+                    // captured on the save screen, shown here as a one-line
+                    // preview (full text on hover) so a later restore can be
+                    // matched to the right snapshot.
+                    delegate: Column {
                         width: parent.width
-                        height: 36
-                        radius: Style.cornerRadius
-                        color: Qt.darker(Color.bar.background, 1.05)
+                        spacing: 2
 
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.margins: 6
-                            spacing: 6
+                        Rectangle {
+                            width: parent.width
+                            height: 36
+                            radius: Style.cornerRadius
+                            color: Qt.darker(Color.bar.background, 1.05)
 
-                            Text {
-                                text: root.profileIconFor(modelData)
-                                color: Qt.darker(Color.bar.text, 1.4)
-                                font.pixelSize: 13
-                                Layout.alignment: Qt.AlignVCenter
-                            }
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 6
 
-                            Text {
-                                text: modelData
-                                color: Color.bar.text
-                                font.family: Style.font.family
-                                font.pixelSize: Style.font.body
-                                Layout.alignment: Qt.AlignVCenter
-                                Layout.fillWidth: true
-                                elide: Text.ElideRight
+                                Text {
+                                    text: root.profileIconFor(modelData.name)
+                                    color: Qt.darker(Color.bar.text, 1.4)
+                                    font.pixelSize: 13
+                                    Layout.alignment: Qt.AlignVCenter
+                                }
 
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    hoverEnabled: true
-                                    enabled: !root.isRestoring && !root.isSnapshotting
-                                    onContainsMouseChanged: parent.parent.parent.color = containsMouse ? root.hoverBg : Qt.darker(Color.bar.background, 1.05)
-                                    onClicked: root.doRestore(modelData)
+                                Text {
+                                    text: modelData.name
+                                    color: Color.bar.text
+                                    font.family: Style.font.family
+                                    font.pixelSize: Style.font.body
+                                    Layout.alignment: Qt.AlignVCenter
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        hoverEnabled: true
+                                        enabled: !root.isRestoring && !root.isSnapshotting
+                                        onContainsMouseChanged: parent.parent.parent.color = containsMouse ? root.hoverBg : Qt.darker(Color.bar.background, 1.05)
+                                        onClicked: root.doRestore(modelData.name)
+
+                                        ToolTip.visible: containsMouse && modelData.comment.length > 0
+                                        ToolTip.delay: 400
+                                        ToolTip.text: modelData.comment
+                                    }
+                                }
+
+                                Text {
+                                    text: "󰆴"
+                                    color: Qt.darker(Color.bar.text, 1.4)
+                                    font.pixelSize: 13
+                                    Layout.alignment: Qt.AlignVCenter
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        hoverEnabled: true
+                                        enabled: !root.isRestoring && !root.isSnapshotting
+                                        onContainsMouseChanged: parent.parent.parent.color = containsMouse ? "#663333" : "transparent"
+                                        onClicked: root.doDelete(modelData.name)
+                                    }
                                 }
                             }
+                        }
 
-                            Text {
-                                text: "󰆴"
-                                color: Qt.darker(Color.bar.text, 1.4)
-                                font.pixelSize: 13
-                                Layout.alignment: Qt.AlignVCenter
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    hoverEnabled: true
-                                    enabled: !root.isRestoring && !root.isSnapshotting
-                                    onContainsMouseChanged: parent.parent.parent.color = containsMouse ? "#663333" : "transparent"
-                                    onClicked: root.doDelete(modelData)
-                                }
-                            }
+                        Text {
+                            width: parent.width
+                            leftPadding: 8
+                            visible: modelData.comment.length > 0
+                            text: modelData.comment.split("\n")[0]
+                            color: Qt.darker(Color.bar.text, 1.7)
+                            font.family: Style.font.family
+                            font.pixelSize: Math.max(9, Style.font.body - 3)
+                            font.italic: true
+                            elide: Text.ElideRight
                         }
                     }
                 }
@@ -605,6 +646,30 @@ Panel {
                 Keys.onEnterPressed: confirmSave()
             }
 
+            // Optional multiline note, shown as a one-line preview (full text
+            // on hover) beside the profile name in the list below, so a
+            // later restore can be matched to the right snapshot. Return
+            // inserts a newline here rather than submitting - only the Save
+            // button (or its own Enter-less TextArea default) confirms.
+            TextArea {
+                id: commentField
+                width: parent.width
+                height: 70
+                placeholderText: "Notes (optional) - what's in this snapshot?"
+                color: Color.bar.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                leftPadding: 10
+                topPadding: 8
+                wrapMode: TextArea.Wrap
+                background: Rectangle {
+                    color: Qt.darker(Color.bar.background, 1.08)
+                    radius: Style.cornerRadius
+                    border.color: Qt.darker(Color.bar.text, 1.15)
+                    border.width: 1
+                }
+            }
+
             Rectangle {
                 width: parent.width
                 height: 36
@@ -650,6 +715,7 @@ Panel {
                     onClicked: {
                         root.showingNameInput = false
                         root.pendingSnapshot = null
+                        commentField.text = ""
                         root.lastAction = "Snapshot discarded"
                     }
                 }
@@ -669,10 +735,15 @@ Panel {
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
-                // The helper emits bare validated names (one per line, capped
-                // at 256), so no path parsing or shell is involved.
-                var lines = text.trim().split("\n").filter(s => s.length > 0)
-                root.profiles = lines
+                // The helper emits a JSON array of {name, comment} (name
+                // already validated server-side, capped at 256 entries; a
+                // missing/invalid comment comes back as "").
+                try {
+                    var entries = JSON.parse(text)
+                    root.profiles = Array.isArray(entries) ? entries : []
+                } catch (e) {
+                    root.profiles = []
+                }
             }
         }
     }
@@ -896,6 +967,7 @@ Panel {
             root.isSnapshotting = false
             root.lastAction = "Captured " + snapTabsProc._windows.length + " windows"
             saveNameField.text = generateDefaultName()
+            commentField.text = ""
             root.showingNameInput = true
         }
 
@@ -950,13 +1022,14 @@ Panel {
     // profile assembly (kept on root so snapTabsProc.assemble can read it).
     // --- Save ---
 
-    function doSave(name) {
+    function doSave(name, comment) {
         if (!root.pendingSnapshot || name.length === 0) return
         var safe = root.sanitizeProfileName(name)
         if (safe === null) {
             root.lastAction = "Invalid profile name"
             return
         }
+        root.pendingSnapshot.comment = root.sanitizeComment(comment)
         var json = JSON.stringify(root.pendingSnapshot, null, 2)
         // The store helper reads the JSON from stdin (never a temp file or a
         // shell heredoc). payload size is bounded by the helper; enforcement
@@ -1558,7 +1631,7 @@ Panel {
     function confirmSave() {
         var name = saveNameField.text.trim()
         if (name.length > 0) {
-            root.doSave(name)
+            root.doSave(name, commentField.text)
         }
     }
 }

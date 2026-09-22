@@ -13,6 +13,7 @@ An Omarchy shell plugin (Quickshell) for Hyprland that snapshots your window lay
 - **Conflict Detection** — Avoids duplicate spawns; repositions existing windows instead of relaunching them
 - **Layout Restoration** — Restores floating and fullscreen state for matched and spawned windows
 - **Window Grouping** — Captures which windows were tabbed together and reforms the same groups on restore (best-effort; most reliable for floating window groups)
+- **Snapshot Notes** — Add an optional multiline note when saving, shown as a preview under each profile in the list
 - **Desktop Notifications** — Feedback on snapshot/save/restore/delete actions
 
 ## Installation

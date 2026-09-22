@@ -67,7 +67,7 @@ test("save, list, load, delete round trip", { skip: !hasPython() }, () => {
 
         const listed = run(["list", dir])
         assert.equal(listed.status, 0)
-        assert.equal(listed.stdout.trim(), "my-work")
+        assert.deepEqual(JSON.parse(listed.stdout), [{ name: "my-work", comment: "" }])
 
         const loaded = run(["load", dir, "my-work"])
         assert.equal(loaded.status, 0, loaded.stderr)
@@ -75,7 +75,46 @@ test("save, list, load, delete round trip", { skip: !hasPython() }, () => {
 
         const del = run(["delete", dir, "my-work"])
         assert.equal(del.status, 0, del.stderr)
-        assert.equal(run(["list", dir]).stdout.trim(), "")
+        assert.deepEqual(JSON.parse(run(["list", dir]).stdout), [])
+    } finally {
+        cleanup()
+    }
+})
+
+test("list surfaces each profile's comment", { skip: !hasPython() }, () => {
+    const { dir, cleanup } = tmpStore()
+    try {
+        run(["init", dir])
+        const withComment = JSON.stringify({
+            windows: [{ class: "org.gnome.Nautilus", workspace: "3" }],
+            comment: "line one\nline two",
+        })
+        run(["save", dir, "noted"], withComment)
+        run(["save", dir, "bare"], valid) // no comment field at all
+
+        const listed = JSON.parse(run(["list", dir]).stdout)
+        const byName = Object.fromEntries(listed.map((e) => [e.name, e.comment]))
+        assert.equal(byName["noted"], "line one\nline two")
+        assert.equal(byName["bare"], "")
+    } finally {
+        cleanup()
+    }
+})
+
+test("save rejects an oversized comment", { skip: !hasPython() }, () => {
+    const { dir, cleanup } = tmpStore()
+    try {
+        run(["init", dir])
+        const tooLong = JSON.stringify({
+            windows: [{ class: "org.gnome.Nautilus" }],
+            comment: "x".repeat(4001),
+        })
+        assert.notEqual(run(["save", dir, "toolong"], tooLong).status, 0)
+        const okLen = JSON.stringify({
+            windows: [{ class: "org.gnome.Nautilus" }],
+            comment: "x".repeat(4000),
+        })
+        assert.equal(run(["save", dir, "oklen"], okLen).status, 0)
     } finally {
         cleanup()
     }
@@ -164,7 +203,7 @@ test("save rejects beyond the 256 profile cap", { skip: !hasPython() }, () => {
             const r = run(["save", dir, `p${String(i).padStart(3, "0")}`], valid)
             assert.equal(r.status, 0, `save ${i}: ${r.stderr}`)
         }
-        const listed = run(["list", dir]).stdout.trim().split("\n")
+        const listed = JSON.parse(run(["list", dir]).stdout)
         assert.equal(listed.length, 256)
         // A brand-new name is refused once the cap is reached.
         assert.notEqual(run(["save", dir, "overflow"], valid).status, 0)

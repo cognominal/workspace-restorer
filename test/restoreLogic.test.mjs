@@ -24,6 +24,8 @@ import {
     buildRestoreGroups,
     mergeDirectionFor,
     groupMergeLines,
+    sanitizeComment,
+    MAX_COMMENT_LENGTH,
 } from "../restoreLogic.mjs"
 
 const DIR = "/home/user/.config/omarchy/workspace-restorer"
@@ -363,6 +365,35 @@ test("enforceProfileCardinality rejects tabs beyond the per-window cap", () => {
     assert.equal(enforceProfileCardinality({ windows: [{ tabs: window }] }) === null, false)
     const over = Array.from({ length: MAX_TABS_PER_WINDOW + 1 }, () => ({ url: "https://x.com/" }))
     assert.equal(enforceProfileCardinality({ windows: [{ tabs: over }] }), null)
+})
+
+test("enforceProfileCardinality accepts a bounded comment, rejects an oversized one", () => {
+    assert.equal(MAX_COMMENT_LENGTH, 4000)
+    const windows = [{ class: "kitty" }]
+    assert.equal(enforceProfileCardinality({ windows, comment: "x".repeat(MAX_COMMENT_LENGTH) }) === null, false)
+    assert.equal(enforceProfileCardinality({ windows, comment: "x".repeat(MAX_COMMENT_LENGTH + 1) }), null)
+    // Absent/non-string comment doesn't reject (old profiles predate the field).
+    assert.equal(enforceProfileCardinality({ windows }) === null, false)
+})
+
+// --- sanitizeComment ---
+
+test("sanitizeComment passes through plain multiline text", () => {
+    assert.equal(sanitizeComment("line one\nline two"), "line one\nline two")
+    assert.equal(sanitizeComment(""), "")
+})
+
+test("sanitizeComment normalizes CRLF and strips control characters, keeping newlines/tabs", () => {
+    assert.equal(sanitizeComment("a\r\nb"), "a\nb")
+    assert.equal(sanitizeComment("a\nb\tc"), "a\nb\tc")
+    assert.equal(sanitizeComment("a\x00\x07\x1fb"), "ab")
+})
+
+test("sanitizeComment caps length and tolerates non-string input", () => {
+    assert.equal(sanitizeComment("x".repeat(MAX_COMMENT_LENGTH + 50)).length, MAX_COMMENT_LENGTH)
+    assert.equal(sanitizeComment(null), "")
+    assert.equal(sanitizeComment(undefined), "")
+    assert.equal(sanitizeComment(42), "")
 })
 
 // --- buildBrowserLaunchCommands ---
