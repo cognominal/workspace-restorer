@@ -1081,6 +1081,35 @@ Panel {
         }
     }
 
+    // Bash lines that put things back the way they were before this restore
+    // touched anything: refocus the workspace that was active (ORIG_WORKSPACE,
+    // captured up front in buildAndRunRestore), then reconcile the scratchpad/
+    // special-workspace open-or-closed state (ORIG_SPECIAL) on whichever
+    // monitor is now focused. toggle_special only *toggles* - it can't be set
+    // directly - so this only calls it when the current state actually
+    // differs from the captured one, closing whatever's open now and/or
+    // reopening what was open before, bare special-workspace names only
+    // ([A-Za-z0-9_]{1,32}, stripped of the "special:" prefix) so a stray
+    // character from hyprctl's own output can never break out of the Lua
+    // string literal passed to hyprctl dispatch. Used at both points a
+    // restore can finish: right after Phase 3 when there's no safety pass, or
+    // at the end of the safety pass when there is one - whichever runs last.
+    function restoreOrigFocusLines(indent) {
+        var pad = indent || ""
+        return [
+            pad + "[ -n \"$ORIG_WORKSPACE\" ] && hyprctl dispatch \"hl.dsp.focus({workspace='$ORIG_WORKSPACE'})\" 2>>\"$LOGFILE\" || true",
+            pad + "CUR_SPECIAL=$(hyprctl monitors -j 2>/dev/null | jq -r '([.[] | select(.focused==true) | .specialWorkspace.name][0]) // \"\"' 2>/dev/null)",
+            pad + "if [ \"$CUR_SPECIAL\" != \"$ORIG_SPECIAL\" ]; then",
+            pad + "  CNAME=\"${CUR_SPECIAL#special:}\"",
+            pad + "  ONAME=\"${ORIG_SPECIAL#special:}\"",
+            pad + "  [[ \"$CNAME\" =~ ^[A-Za-z0-9_]{1,32}$ ]] || CNAME=\"\"",
+            pad + "  [[ \"$ONAME\" =~ ^[A-Za-z0-9_]{1,32}$ ]] || ONAME=\"\"",
+            pad + "  [ -n \"$CNAME\" ] && hyprctl dispatch \"hl.dsp.workspace.toggle_special('$CNAME')\" 2>>\"$LOGFILE\" || true",
+            pad + "  [ -n \"$ONAME\" ] && hyprctl dispatch \"hl.dsp.workspace.toggle_special('$ONAME')\" 2>>\"$LOGFILE\" || true",
+            pad + "fi"
+        ]
+    }
+
     // Build and run the restore script. Extracted into its own function so the
     // whole construction is wrapped in try/catch: any unexpected throw here
     // must reset isRestoring, or the widget stays stuck in "Restoring..."
@@ -1106,6 +1135,16 @@ Panel {
             // the end of the safety pass when there is one).
             lines.push("ORIG_WORKSPACE=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.name' 2>/dev/null)")
             lines.push("export ORIG_WORKSPACE")
+
+            // Special workspaces (e.g. the scratchpad) overlay on top of the
+            // focused monitor's normal workspace and are toggled open/closed
+            // independently of it - hyprctl reports the open one (if any) as
+            // that monitor's specialWorkspace.name (e.g. "special:scratchpad",
+            // or "" when none is open). Remember whether one was open before
+            // the restore touches anything, so it can be put back at the same
+            // two points ORIG_WORKSPACE is refocused (see restoreOrigFocusLines).
+            lines.push("ORIG_SPECIAL=$(hyprctl monitors -j 2>/dev/null | jq -r '([.[] | select(.focused==true) | .specialWorkspace.name][0]) // \"\"' 2>/dev/null)")
+            lines.push("export ORIG_SPECIAL")
 
             // Computed up front (used both to gate the auto_group guard below
             // and by Phase 2b2 further down) so we only touch the Hyprland
@@ -1437,9 +1476,10 @@ Panel {
                     safety.push("done")
                 }
                 // This is the last thing to run when a safety pass exists, so
-                // it's the one that refocuses the workspace the user was
-                // actually on before the restore started.
-                safety.push("[ -n \"$ORIG_WORKSPACE\" ] && hyprctl dispatch \"hl.dsp.focus({workspace='$ORIG_WORKSPACE'})\" 2>>\"$LOGFILE\" || true")
+                // it's the one that puts the original workspace/scratchpad
+                // state back.
+                var safetyFocusLines = root.restoreOrigFocusLines("")
+                for (var sfl = 0; sfl < safetyFocusLines.length; sfl++) safety.push(safetyFocusLines[sfl])
                 // Write and detach the safety pass so it doesn't delay the
                 // restore notification. The script and everything it uses
                 // live in the private $WSROOT (never shared /tmp). Hand
@@ -1457,8 +1497,10 @@ Panel {
                     lines.push("hyprctl keyword group:auto_group \"$ORIG_AUTOGROUP\" 2>>\"$LOGFILE\" || true")
                 }
                 // No safety pass means this script is also the last thing to
-                // run, so it's the one that refocuses the original workspace.
-                lines.push("[ -n \"$ORIG_WORKSPACE\" ] && hyprctl dispatch \"hl.dsp.focus({workspace='$ORIG_WORKSPACE'})\" 2>>\"$LOGFILE\" || true")
+                // run, so it's the one that puts the original workspace/
+                // scratchpad state back.
+                var mainFocusLines = root.restoreOrigFocusLines("")
+                for (var mfl = 0; mfl < mainFocusLines.length; mfl++) lines.push(mainFocusLines[mfl])
             }
 
             var totalCount = toMove.length + toFloat.length + spawnCount

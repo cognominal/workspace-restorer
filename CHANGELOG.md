@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.7] - 2026-09-22
+
+### Added
+
+- Restore now also puts the scratchpad (or any other special workspace) back in the open/closed state it was in before restore started, alongside the workspace-refocus added in 1.1.6. Restoring a profile can itself close an open special workspace as a side effect of focusing normal workspaces onto which windows are spawned; the state is now reconciled once all of that is done, closing whatever's open and/or reopening what was open before, on whichever monitor ends up focused.
+
 ## [1.1.6] - 2026-09-22
 
 ### Added
