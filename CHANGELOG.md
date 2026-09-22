@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.6] - 2026-09-22
+
+### Added
+
+- Restore now returns focus to whichever workspace was active before it started. Phase 3 focuses each window's target workspace in turn so new spawns land in the right place, which previously left you on whatever workspace was targeted last (not necessarily the one you began on) once restore finished.
+
+### Fixed
+
+- The Save/Cancel buttons on the save-name screen, and the per-profile delete icon, referenced the wrong ancestor when applying their hover highlight (`parent.parent.color` instead of the actual containing `Rectangle`), so hovering them spammed a "Cannot assign to non-existent property color" warning and never highlighted.
+
+## [1.1.5] - 2026-09-22
+
+### Added
+
+- Window grouping (tabbed windows) is now captured and restored. A snapshot records which windows were grouped together and their tab order; restore reforms the same groups by merging each member into the group via Hyprland's directional group-move, using whichever member resolves first (an already-matched window, or a freshly spawned one once the safety net discovers it) as the anchor. This is best-effort: Hyprland only exposes group merging as a directional search rather than an address-targeted one, so it's most reliable for groups of floating windows (which restore to their exact captured position) and less so for tiled groups sharing a busy workspace.
+- Restore now temporarily disables `group:auto_group` (on by default in Hyprland) whenever a profile has groups to reform. Phase 3 launches several windows onto the same workspace in quick succession, and with `auto_group` left on Hyprland can silently join unrelated freshly-spawned windows into whatever group is active on that workspace, fighting the explicit group-merges above. The original value is restored once all of this restore's work finishes (the safety pass if one ran, otherwise the main script).
+
+## [1.1.4] - 2026-09-22
+
+### Fix
+
+- Windows on Omarchy's special/scratchpad workspace (`special:scratchpad`) were silently dropped on restore: `safeWorkspace` only accepted plain alphanumeric names, so any snapshotted window there was skipped instead of being spawned/moved back onto the scratchpad. The validator now also accepts the `special:<name>` form used by Hyprland/Omarchy special workspaces.
+
 ## [1.1.3] - 2026-09-11
 
 ### Fix

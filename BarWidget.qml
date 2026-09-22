@@ -190,10 +190,13 @@ Panel {
 
     // Validate a workspace name from editable metadata. Real workspaces are
     // short strings of digits (optionally with a name/label), so only accept
-    // a conservative safe set to keep it from injecting shell/jq.
+    // a conservative safe set to keep it from injecting shell/jq. Also accept
+    // Hyprland/Omarchy special workspaces (e.g. the scratchpad, reported by
+    // hyprctl as "special:scratchpad"), which use a "special:" prefix ahead
+    // of the same safe name charset.
     function safeWorkspace(ws) {
         if (typeof ws !== "string") return null
-        if (!/^[_a-z0-9]{1,32}$/i.test(ws)) return null
+        if (!/^(special:)?[_a-z0-9]{1,32}$/i.test(ws)) return null
         return ws
     }
 
@@ -259,6 +262,103 @@ Panel {
                 } catch(e) {}
             }
         }
+    }
+
+    // --- Window grouping (tabbed windows). Mirrors the pure helpers in
+    // restoreLogic.mjs - kept in sync with the QML-side snapshot/restore. ---
+
+    // Hyprland reports each grouped (tabbed) window's `grouped` field as the
+    // full list of member addresses, in tab order, identically on every
+    // member. From a raw `hyprctl -j clients` array, assign every member a
+    // stable groupId (shared by all windows in that group, scoped to this
+    // one snapshot) and a groupOrder (its index in the shared tab order).
+    // Windows that aren't grouped, or are a lone leftover group of one, get
+    // neither.
+    function buildGroupMeta(clients) {
+        var meta = {}
+        if (!Array.isArray(clients)) return meta
+        var groupIdByKey = {}
+        var nextGroupId = 0
+        for (var i = 0; i < clients.length; i++) {
+            var c = clients[i]
+            if (!c || typeof c.address !== "string") continue
+            var grouped = Array.isArray(c.grouped) ? c.grouped : []
+            if (grouped.length <= 1) continue
+            var order = grouped.indexOf(c.address)
+            if (order === -1) continue
+            var key = grouped.slice().sort().join(",")
+            if (!(key in groupIdByKey)) groupIdByKey[key] = nextGroupId++
+            meta[c.address] = { groupId: groupIdByKey[key], groupOrder: order }
+        }
+        return meta
+    }
+
+    // From a profile's windows array (each optionally carrying .groupId /
+    // .groupOrder, as attached by buildGroupMeta at snapshot time), collect
+    // the groups that still have 2+ members. For each, pick the
+    // lowest-groupOrder member as the fixed position reference (refIndex,
+    // used only for merge-direction math - restore may end up resolving
+    // members in a different order at runtime) and list every member's
+    // window index in groupOrder.
+    function buildRestoreGroups(windows) {
+        if (!Array.isArray(windows)) return []
+        var byId = {}
+        for (var i = 0; i < windows.length; i++) {
+            var w = windows[i]
+            if (!w || w.groupId === null || w.groupId === undefined) continue
+            var gid = w.groupId
+            if (!byId[gid]) byId[gid] = []
+            byId[gid].push({ index: i, order: (typeof w.groupOrder === "number" ? w.groupOrder : 0) })
+        }
+        var groups = []
+        for (var gid2 in byId) {
+            var members = byId[gid2]
+            if (members.length < 2) continue
+            members.sort(function (a, b) { return a.order - b.order })
+            groups.push({
+                groupId: gid2,
+                refIndex: members[0].index,
+                members: members.map(function (m) { return m.index })
+            })
+        }
+        return groups
+    }
+
+    // Pick which of Hyprland's four `into_group` directions ('l'/'r'/'u'/'d')
+    // should carry memberWin into a group with refWin, based on their
+    // captured snapshot positions (grouped windows share one tile/rect, so
+    // for most groups this is a degenerate 0,0 delta and any direction
+    // works).
+    function mergeDirectionFor(refWin, memberWin) {
+        var rx = refWin && Array.isArray(refWin.position) ? root.numOr(refWin.position[0]) : 0
+        var ry = refWin && Array.isArray(refWin.position) ? root.numOr(refWin.position[1]) : 0
+        var mx = memberWin && Array.isArray(memberWin.position) ? root.numOr(memberWin.position[0]) : 0
+        var my = memberWin && Array.isArray(memberWin.position) ? root.numOr(memberWin.position[1]) : 0
+        var dx = rx - mx
+        var dy = ry - my
+        if (Math.abs(dx) >= Math.abs(dy)) return dx < 0 ? "l" : "r"
+        return dy < 0 ? "u" : "d"
+    }
+
+    // Build the restore-script lines that reform one group member into its
+    // group: the first member to resolve (matched synchronously, or
+    // discovered later by the Phase 3b safety net) becomes the group's
+    // anchor address; every later member is merged into it via a directional
+    // group-move. addrExpr is either a literal hyprctl address (matched
+    // windows, known at build time) or a shell variable reference like "$A"
+    // (spawned windows, resolved at runtime by the safety net) - both are
+    // embedded verbatim into the generated bash/dispatch text.
+    function groupMergeLines(addrExpr, groupId, dir, indent) {
+        var pad = indent || ""
+        var varName = "GRP" + groupId + "_ADDR"
+        return [
+            pad + "if [ -z \"${" + varName + ":-}\" ]; then",
+            pad + "  export " + varName + "=\"" + addrExpr + "\"",
+            pad + "else",
+            pad + "  echo \"[group-merge] gid=" + groupId + " addr=" + addrExpr + " dir=" + dir + "\" >> \"$LOGFILE\"",
+            pad + "  hyprctl dispatch \"hl.dsp.window.move({window='address:" + addrExpr + "', into_group='" + dir + "'})\" 2>>\"$LOGFILE\" || true",
+            pad + "fi"
+        ]
     }
 
     function resolveExe(className) {
@@ -445,7 +545,7 @@ Panel {
                                     cursorShape: Qt.PointingHandCursor
                                     hoverEnabled: true
                                     enabled: !root.isRestoring && !root.isSnapshotting
-                                    onContainsMouseChanged: parent.parent.color = containsMouse ? "#663333" : "transparent"
+                                    onContainsMouseChanged: parent.parent.parent.color = containsMouse ? "#663333" : "transparent"
                                     onClicked: root.doDelete(modelData)
                                 }
                             }
@@ -523,7 +623,7 @@ Panel {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
                     hoverEnabled: true
-                    onContainsMouseChanged: parent.parent.color = containsMouse ? root.selectedBg : root.hoverBg
+                    onContainsMouseChanged: parent.color = containsMouse ? root.selectedBg : root.hoverBg
                     onClicked: confirmSave()
                 }
             }
@@ -546,7 +646,7 @@ Panel {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
                     hoverEnabled: true
-                    onContainsMouseChanged: parent.parent.color = containsMouse ? Qt.darker(Color.bar.text, 1.1) : Qt.darker(Color.bar.background, 1.05)
+                    onContainsMouseChanged: parent.color = containsMouse ? Qt.darker(Color.bar.text, 1.1) : Qt.darker(Color.bar.background, 1.05)
                     onClicked: {
                         root.showingNameInput = false
                         root.pendingSnapshot = null
@@ -697,6 +797,10 @@ Panel {
                     // carries the right flag (e.g. "nautilus --new-window").
                     var pidCmd = {}
 
+                    // Which windows were tabbed together (grouped), and in
+                    // what order, so restore can reform the same groups.
+                    var groupMeta = root.buildGroupMeta(clients)
+
                     for (var i = 0; i < clients.length; i++) {
                         var c = clients[i]
                         var monName = monMap[c.monitor] || String(c.monitor)
@@ -714,6 +818,7 @@ Panel {
                         // right window and restore can reopen them in place.
                         var btype = root.browserTypeForClass(c.class)
                         var bprofile = btype ? root.resolveBrowserProfile(btype, c._cmdline) : null
+                        var gm = groupMeta[c.address]
 
                         windows.push({
                             "class": c.class,
@@ -733,7 +838,9 @@ Panel {
                             "fullscreen": c.fullscreen,
                             "browser": btype,
                             "browserProfile": bprofile,
-                            "tabs": null
+                            "tabs": null,
+                            "groupId": gm ? gm.groupId : null,
+                            "groupOrder": gm ? gm.groupOrder : null
                         })
                     }
                     snapTabsProc._windows = windows
@@ -990,6 +1097,39 @@ Panel {
             lines.push("trap 'if [ \"$SAFETY_OWNED\" != \"1\" ]; then rm -rf \"$WSROOT\"; fi' EXIT")
             lines.push("echo \"[start] wsroot=$WSROOT profile_windows=" + profile.windows.length + " existing=" + (existing ? existing.length : 0) + "\" >> \"$LOGFILE\"")
 
+            // Phase 3/3b focus each spawn's target workspace in turn so the
+            // new window lands there, which leaves whichever workspace was
+            // targeted last as the active one. Remember what was actually
+            // active before any of that happens, so it can be refocused once
+            // all of this restore's work is done (see the two refocus points
+            // below: right after Phase 3 when there's no safety pass, or at
+            // the end of the safety pass when there is one).
+            lines.push("ORIG_WORKSPACE=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.name' 2>/dev/null)")
+            lines.push("export ORIG_WORKSPACE")
+
+            // Computed up front (used both to gate the auto_group guard below
+            // and by Phase 2b2 further down) so we only touch the Hyprland
+            // config when this profile actually has groups to reform.
+            var restoreGroups = root.buildRestoreGroups(profile.windows)
+            var hasGroups = restoreGroups.length > 0
+
+            // Hyprland's group:auto_group (on by default) auto-joins a newly
+            // mapped window into whatever group is currently active on its
+            // workspace. Phase 3 below launches several windows onto the same
+            // workspace in quick succession, so with auto_group left on,
+            // Hyprland can silently group unrelated windows together and
+            // fight the explicit group-merges in Phase 2b2/3b. Save the
+            // current value and force it off for the duration of the
+            // restore; it's turned back on wherever this restore's work
+            // actually finishes (see the safety-pass trap below, or right
+            // after Phase 2b2 when there's no safety pass).
+            if (hasGroups) {
+                lines.push("ORIG_AUTOGROUP=$(hyprctl getoption group:auto_group -j 2>/dev/null | jq -r 'if .bool then 1 else 0 end' 2>/dev/null)")
+                lines.push("[ -z \"$ORIG_AUTOGROUP\" ] && ORIG_AUTOGROUP=1")
+                lines.push("export ORIG_AUTOGROUP")
+                lines.push("hyprctl keyword group:auto_group 0 2>>\"$LOGFILE\" || true")
+            }
+
             // Track which profile windows have been matched
             var matched = []
             for (var p = 0; p < profile.windows.length; p++) matched[p] = false
@@ -997,6 +1137,10 @@ Panel {
             var toMove = []
             var toFloat = []
             var matchedAddrs = []
+            // Profile window index -> live address, for windows matched to an
+            // already-open window (known synchronously, unlike spawned windows
+            // whose address is only discovered later by the safety net).
+            var matchedAddrByIndex = {}
             // Addresses of currently-open browser windows whose snapshot had
             // captured tabs. These are closed (so the browser process quits)
             // before we relaunch it fresh with exactly the snapshot's tabs.
@@ -1038,6 +1182,7 @@ Panel {
                         }
                         matched[bestIdx] = true
                         matchedAddrs.push(e.address)
+                        matchedAddrByIndex[bestIdx] = e.address
                         var tws = root.safeWorkspace(target.workspace)
                         // Move to correct workspace if needed
                         if (tws !== null && String(e.workspace.name) !== String(target.workspace)) {
@@ -1109,6 +1254,32 @@ Panel {
                 }
                 lines.push("hyprctl dispatch \"hl.dsp.window.move({x=" + fx + ", y=" + fy + ", relative=false, window='address:" + fl.addr + "'})\" 2>>\"$LOGFILE\" || true")
                 lines.push("hyprctl dispatch \"hl.dsp.window.resize({x=" + fw + ", y=" + fh + ", window='address:" + fl.addr + "'})\" 2>>\"$LOGFILE\" || true")
+            }
+
+            // Phase 2b2: Reform window groups (tabbed windows). For every
+            // profile group with 2+ members, whichever member resolves first
+            // - matched here synchronously, or discovered later by the
+            // Phase 3b safety net - becomes that group's anchor address;
+            // every later member is merged into it via a directional
+            // group-move (see groupMergeLines). Members skipped as unsafe
+            // metadata, or whose relaunch fails, simply never resolve and the
+            // group forms from whichever members did.
+            var groupDirByMember = {}
+            var groupIdByMemberIdx = {}
+            for (var rg = 0; rg < restoreGroups.length; rg++) {
+                var grp = restoreGroups[rg]
+                var refWin = profile.windows[grp.refIndex]
+                for (var gm = 0; gm < grp.members.length; gm++) {
+                    var memberIdx = grp.members[gm]
+                    var dir = root.mergeDirectionFor(refWin, profile.windows[memberIdx])
+                    groupDirByMember[memberIdx] = dir
+                    groupIdByMemberIdx[memberIdx] = grp.groupId
+                    var knownAddr = matchedAddrByIndex[memberIdx]
+                    if (knownAddr) {
+                        var gLines = root.groupMergeLines(knownAddr, grp.groupId, dir, "")
+                        for (var gl = 0; gl < gLines.length; gl++) lines.push(gLines[gl])
+                    }
+                }
             }
 
             // Phase 2c: Close existing browser windows whose snapshot carried
@@ -1189,7 +1360,8 @@ Panel {
                         fullscreen: w.fullscreen,
                         splitRatio: w.splitRatio,
                         pos: w.position,
-                        size: w.size
+                        size: w.size,
+                        pIndex: j
                     })
                     spawnCount++
                 }
@@ -1210,7 +1382,13 @@ Panel {
                 // The safety pass is the last consumer of the private WSROOT,
                 // so it owns cleanup - removes the whole private dir (only
                 // our own files) when it finishes, with a trap for safety.
-                safety.push("trap 'rm -rf \"$WSROOT\"' EXIT")
+                // When this restore disabled group:auto_group above, this is
+                // also the last thing to run, so it puts the setting back.
+                if (hasGroups) {
+                    safety.push("trap 'hyprctl keyword group:auto_group \"$ORIG_AUTOGROUP\" >/dev/null 2>&1 || true; rm -rf \"$WSROOT\"' EXIT")
+                } else {
+                    safety.push("trap 'rm -rf \"$WSROOT\"' EXIT")
+                }
                 safety.push("MATCHED_ADDRS=\"" + matchedAddrs.join(" ") + "\"")
                 safety.push("sleep 1")
                 safety.push("MOVED_ADDRS=\"\"")
@@ -1244,12 +1422,24 @@ Panel {
                         safety.push("      hyprctl dispatch \"hl.dsp.window.fullscreen({mode='fullscreen', window='address:$A'})\" 2>>\"$LOGFILE\" || true")
                     }
                     safety.push("    fi")
+                    // Reform this window's group, if it was part of one (see
+                    // Phase 2b2 above) - regardless of whether a workspace
+                    // move/reposition happened above, since the window still
+                    // needs to be merged either way.
+                    if (t.pIndex in groupDirByMember) {
+                        var mLines = root.groupMergeLines("$A", groupIdByMemberIdx[t.pIndex], groupDirByMember[t.pIndex], "    ")
+                        for (var ml = 0; ml < mLines.length; ml++) safety.push(mLines[ml])
+                    }
                     safety.push("    HANDLED=1")
                     safety.push("  done <<< \"$MATCHES\"")
                     safety.push("  ATTEMPT=$((ATTEMPT+1))")
                     safety.push("  if [ $HANDLED -eq 0 ]; then sleep 0.5; fi")
                     safety.push("done")
                 }
+                // This is the last thing to run when a safety pass exists, so
+                // it's the one that refocuses the workspace the user was
+                // actually on before the restore started.
+                safety.push("[ -n \"$ORIG_WORKSPACE\" ] && hyprctl dispatch \"hl.dsp.focus({workspace='$ORIG_WORKSPACE'})\" 2>>\"$LOGFILE\" || true")
                 // Write and detach the safety pass so it doesn't delay the
                 // restore notification. The script and everything it uses
                 // live in the private $WSROOT (never shared /tmp). Hand
@@ -1260,6 +1450,15 @@ Panel {
                 lines.push("printf '%s\\n' " + Util.shellQuote(safety.join("\n")) + " > \"$SAFETY\" && chmod 700 \"$SAFETY\"")
                 lines.push("nohup bash \"$SAFETY\" >/dev/null 2>&1 &")
                 lines.push("disown")
+            } else {
+                if (hasGroups) {
+                    // No safety pass means this script is the last thing to
+                    // run - put the setting back here instead.
+                    lines.push("hyprctl keyword group:auto_group \"$ORIG_AUTOGROUP\" 2>>\"$LOGFILE\" || true")
+                }
+                // No safety pass means this script is also the last thing to
+                // run, so it's the one that refocuses the original workspace.
+                lines.push("[ -n \"$ORIG_WORKSPACE\" ] && hyprctl dispatch \"hl.dsp.focus({workspace='$ORIG_WORKSPACE'})\" 2>>\"$LOGFILE\" || true")
             }
 
             var totalCount = toMove.length + toFloat.length + spawnCount

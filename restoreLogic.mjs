@@ -35,7 +35,10 @@ export function sanitizeLaunchCommand(raw, fallbackClass) {
 
 export function safeWorkspace(ws) {
     if (typeof ws !== "string") return null
-    if (!/^[_a-z0-9]{1,32}$/i.test(ws)) return null
+    // Also accept Hyprland/Omarchy special workspaces (e.g. the scratchpad,
+    // reported by hyprctl as "special:scratchpad"), which use a "special:"
+    // prefix ahead of the same safe name charset.
+    if (!/^(special:)?[_a-z0-9]{1,32}$/i.test(ws)) return null
     return ws
 }
 
@@ -87,6 +90,99 @@ export function buildMonitorMap(monitors) {
         map[monitors[i].id] = monitors[i].name
     }
     return map
+}
+
+// --- Window grouping (tabbed windows) ---
+//
+// Hyprland reports each grouped (tabbed) window's `grouped` field as the full
+// list of member addresses, in tab order, identically on every member. From
+// a raw `hyprctl -j clients` array, assign every member a stable groupId
+// (shared by all windows in that group, scoped to this one snapshot) and a
+// groupOrder (its index in the shared tab order). Windows that aren't
+// grouped, or are a lone leftover group of one, get neither.
+export function buildGroupMeta(clients) {
+    var meta = {}
+    if (!Array.isArray(clients)) return meta
+    var groupIdByKey = {}
+    var nextGroupId = 0
+    for (var i = 0; i < clients.length; i++) {
+        var c = clients[i]
+        if (!c || typeof c.address !== "string") continue
+        var grouped = Array.isArray(c.grouped) ? c.grouped : []
+        if (grouped.length <= 1) continue
+        var order = grouped.indexOf(c.address)
+        if (order === -1) continue
+        var key = grouped.slice().sort().join(",")
+        if (!(key in groupIdByKey)) groupIdByKey[key] = nextGroupId++
+        meta[c.address] = { groupId: groupIdByKey[key], groupOrder: order }
+    }
+    return meta
+}
+
+// From a profile's windows array (each optionally carrying .groupId /
+// .groupOrder, as attached by buildGroupMeta at snapshot time), collect the
+// groups that still have 2+ members. For each, pick the lowest-groupOrder
+// member as the fixed position reference (`refIndex`, used only for merge-
+// direction math - restore may end up resolving members in a different
+// order at runtime) and list every member's window index in groupOrder.
+export function buildRestoreGroups(windows) {
+    if (!Array.isArray(windows)) return []
+    var byId = {}
+    for (var i = 0; i < windows.length; i++) {
+        var w = windows[i]
+        if (!w || w.groupId === null || w.groupId === undefined) continue
+        var gid = w.groupId
+        if (!byId[gid]) byId[gid] = []
+        byId[gid].push({ index: i, order: (typeof w.groupOrder === "number" ? w.groupOrder : 0) })
+    }
+    var groups = []
+    for (var gid2 in byId) {
+        var members = byId[gid2]
+        if (members.length < 2) continue
+        members.sort(function (a, b) { return a.order - b.order })
+        groups.push({
+            groupId: gid2,
+            refIndex: members[0].index,
+            members: members.map(function (m) { return m.index })
+        })
+    }
+    return groups
+}
+
+// Pick which of Hyprland's four `into_group` directions ('l'/'r'/'u'/'d')
+// should carry `memberWin` into a group with `refWin`, based on their
+// captured snapshot positions (grouped windows share one tile/rect, so for
+// most groups this is a degenerate 0,0 delta and any direction works).
+export function mergeDirectionFor(refWin, memberWin) {
+    var rx = refWin && Array.isArray(refWin.position) ? numOr(refWin.position[0]) : 0
+    var ry = refWin && Array.isArray(refWin.position) ? numOr(refWin.position[1]) : 0
+    var mx = memberWin && Array.isArray(memberWin.position) ? numOr(memberWin.position[0]) : 0
+    var my = memberWin && Array.isArray(memberWin.position) ? numOr(memberWin.position[1]) : 0
+    var dx = rx - mx
+    var dy = ry - my
+    if (Math.abs(dx) >= Math.abs(dy)) return dx < 0 ? "l" : "r"
+    return dy < 0 ? "u" : "d"
+}
+
+// Build the restore-script lines that reform one group member into its
+// group: the first member to resolve (matched synchronously, or discovered
+// later by the Phase 3b safety net) becomes the group's anchor address; every
+// later member is merged into it via a directional group-move. `addrExpr` is
+// either a literal hyprctl address (matched windows, known at build time) or
+// a shell variable reference like "$A" (spawned windows, resolved at
+// runtime by the safety net) - both are embedded verbatim into the
+// generated bash/dispatch text.
+export function groupMergeLines(addrExpr, groupId, dir, indent) {
+    var pad = indent || ""
+    var varName = "GRP" + groupId + "_ADDR"
+    return [
+        pad + "if [ -z \"${" + varName + ":-}\" ]; then",
+        pad + "  export " + varName + "=\"" + addrExpr + "\"",
+        pad + "else",
+        pad + "  echo \"[group-merge] gid=" + groupId + " addr=" + addrExpr + " dir=" + dir + "\" >> \"$LOGFILE\"",
+        pad + "  hyprctl dispatch \"hl.dsp.window.move({window='address:" + addrExpr + "', into_group='" + dir + "'})\" 2>>\"$LOGFILE\" || true",
+        pad + "fi"
+    ]
 }
 
 // Cardinality bounds applied to any profile before it is used to generate

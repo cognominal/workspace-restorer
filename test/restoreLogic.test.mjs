@@ -20,6 +20,10 @@ import {
     enforceProfileCardinality,
     MAX_WINDOWS,
     MAX_TABS_PER_WINDOW,
+    buildGroupMeta,
+    buildRestoreGroups,
+    mergeDirectionFor,
+    groupMergeLines,
 } from "../restoreLogic.mjs"
 
 const DIR = "/home/user/.config/omarchy/workspace-restorer"
@@ -136,11 +140,16 @@ test("safeWorkspace accepts plain workspaces", () => {
     assert.equal(safeWorkspace("my_work2"), "my_work2")
 })
 
+test("safeWorkspace accepts Omarchy/Hyprland special workspaces (scratchpad)", () => {
+    assert.equal(safeWorkspace("special:scratchpad"), "special:scratchpad")
+    assert.equal(safeWorkspace("special:magic"), "special:magic")
+})
+
 test("safeWorkspace rejects unsafe/empty/oversized", () => {
     assert.equal(safeWorkspace(""), null)
     assert.equal(safeWorkspace(null), null)
     assert.equal(safeWorkspace("a".repeat(33)), null)
-    for (const ws of ["a b", "a;b", "a/b", "$x", "x'y", "a-b", "a.b", "aéb"]) {
+    for (const ws of ["a b", "a;b", "a/b", "$x", "x'y", "a-b", "a.b", "aéb", "special:", "special:a/b", "special:a;b", "other:scratchpad"]) {
         assert.equal(safeWorkspace(ws), null, `should reject: ${ws}`)
     }
 })
@@ -386,4 +395,105 @@ test("buildBrowserLaunchCommands returns base command unchanged for non-browsers
     assert.deepEqual(buildBrowserLaunchCommands("'nautilus'", "nautilus", [{ url: "https://x.com" }]), ["'nautilus'"])
     assert.deepEqual(buildBrowserLaunchCommands("'firefox'", "firefox", []), ["'firefox'"])
     assert.deepEqual(buildBrowserLaunchCommands("", "nautilus", [{ url: "https://x.com" }]), [])
+})
+
+// --- buildGroupMeta ---
+
+test("buildGroupMeta assigns a shared groupId and per-member groupOrder", () => {
+    const clients = [
+        { address: "0xA", grouped: ["0xA", "0xB", "0xC"] },
+        { address: "0xB", grouped: ["0xA", "0xB", "0xC"] },
+        { address: "0xC", grouped: ["0xA", "0xB", "0xC"] },
+        { address: "0xD", grouped: [] },
+    ]
+    const meta = buildGroupMeta(clients)
+    assert.equal(meta["0xA"].groupOrder, 0)
+    assert.equal(meta["0xB"].groupOrder, 1)
+    assert.equal(meta["0xC"].groupOrder, 2)
+    assert.equal(meta["0xA"].groupId, meta["0xB"].groupId)
+    assert.equal(meta["0xB"].groupId, meta["0xC"].groupId)
+    assert.equal(meta["0xD"], undefined)
+})
+
+test("buildGroupMeta assigns distinct groupIds to distinct groups", () => {
+    const clients = [
+        { address: "0xA", grouped: ["0xA", "0xB"] },
+        { address: "0xB", grouped: ["0xA", "0xB"] },
+        { address: "0xC", grouped: ["0xC", "0xD"] },
+        { address: "0xD", grouped: ["0xC", "0xD"] },
+    ]
+    const meta = buildGroupMeta(clients)
+    assert.notEqual(meta["0xA"].groupId, meta["0xC"].groupId)
+})
+
+test("buildGroupMeta treats a lone leftover group as ungrouped", () => {
+    const clients = [{ address: "0xA", grouped: ["0xA"] }]
+    assert.deepEqual(buildGroupMeta(clients), {})
+})
+
+test("buildGroupMeta tolerates malformed input", () => {
+    assert.deepEqual(buildGroupMeta(null), {})
+    assert.deepEqual(buildGroupMeta([null, { address: 5 }, { address: "0xA" }]), {})
+})
+
+// --- buildRestoreGroups ---
+
+test("buildRestoreGroups groups by groupId, ordered by groupOrder, refIndex is the lowest order", () => {
+    const windows = [
+        { class: "kitty", groupId: 1, groupOrder: 2 }, // index 0
+        { class: "kitty", groupId: 1, groupOrder: 0 }, // index 1
+        { class: "kitty", groupId: 1, groupOrder: 1 }, // index 2
+        { class: "firefox" }, // index 3, ungrouped
+    ]
+    const groups = buildRestoreGroups(windows)
+    assert.equal(groups.length, 1)
+    assert.equal(groups[0].refIndex, 1)
+    assert.deepEqual(groups[0].members, [1, 2, 0])
+})
+
+test("buildRestoreGroups drops groups with fewer than 2 members", () => {
+    const windows = [{ class: "kitty", groupId: 1, groupOrder: 0 }]
+    assert.deepEqual(buildRestoreGroups(windows), [])
+})
+
+test("buildRestoreGroups tolerates malformed input", () => {
+    assert.deepEqual(buildRestoreGroups(null), [])
+    assert.deepEqual(buildRestoreGroups([null, {}]), [])
+})
+
+// --- mergeDirectionFor ---
+
+test("mergeDirectionFor points from the member toward the reference window", () => {
+    // ref is to the right of member -> look right ("r") from member to find it.
+    assert.equal(mergeDirectionFor({ position: [500, 100] }, { position: [100, 100] }), "r")
+    assert.equal(mergeDirectionFor({ position: [100, 100] }, { position: [500, 100] }), "l")
+    assert.equal(mergeDirectionFor({ position: [100, 500] }, { position: [100, 100] }), "d")
+    assert.equal(mergeDirectionFor({ position: [100, 100] }, { position: [100, 500] }), "u")
+})
+
+test("mergeDirectionFor defaults to 'r' for co-located or missing positions", () => {
+    assert.equal(mergeDirectionFor({ position: [100, 100] }, { position: [100, 100] }), "r")
+    assert.equal(mergeDirectionFor({}, {}), "r")
+    assert.equal(mergeDirectionFor(null, null), "r")
+})
+
+// --- groupMergeLines ---
+
+test("groupMergeLines sets the anchor var when unset, else dispatches a merge", () => {
+    const lines = groupMergeLines("0xA", 3, "l", "")
+    assert.deepEqual(lines, [
+        "if [ -z \"${GRP3_ADDR:-}\" ]; then",
+        "  export GRP3_ADDR=\"0xA\"",
+        "else",
+        "  echo \"[group-merge] gid=3 addr=0xA dir=l\" >> \"$LOGFILE\"",
+        "  hyprctl dispatch \"hl.dsp.window.move({window='address:0xA', into_group='l'})\" 2>>\"$LOGFILE\" || true",
+        "fi",
+    ])
+})
+
+test("groupMergeLines accepts a shell variable address expression and indent", () => {
+    const lines = groupMergeLines("$A", 0, "r", "    ")
+    assert.equal(lines[0], "    if [ -z \"${GRP0_ADDR:-}\" ]; then")
+    assert.equal(lines[1], "      export GRP0_ADDR=\"$A\"")
+    assert.ok(lines[4].includes("window='address:$A'"))
 })
