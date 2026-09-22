@@ -6,6 +6,8 @@
 
 An Omarchy shell plugin (Quickshell) for Hyprland that snapshots your window layout and brings it back on demand as named profiles.
 
+> **This is a fork** of [Davedes83/workspace-restorer](https://github.com/Davedes83/workspace-restorer), with additional features (window grouping, snapshot notes, theme/plugin-sharing on restore, and various fixes) not yet merged upstream. Use the install instructions below to get this fork rather than the original.
+
 ## Features
 
 - **Snapshot** — Capture every open window: app, workspace, screen position, size, floating/fullscreen state, and working directory
@@ -20,7 +22,7 @@ An Omarchy shell plugin (Quickshell) for Hyprland that snapshots your window lay
 ## Installation
 
 ```bash
-omarchy plugin add https://github.com/Davedes83/workspace-restorer.git --enable
+omarchy plugin add https://github.com/cognominal/workspace-restorer.git --enable
 ```
 
 Then add the plugin to your `~/.config/omarchy/shell.json`:
