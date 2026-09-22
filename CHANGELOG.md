@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.9] - 2026-09-22
+
+### Added
+
+- Snapshots now capture the current Omarchy theme (name, and git origin if it's a user-installed one) and the currently-enabled third-party shell plugins (id + git origin each), so a profile shared with someone else - or restored onto a fresh install - can be made to look and work right, not just spawn windows. See `scripts/capture_environment.sh`.
+- Restore now applies what it safely can with no network access: switches to the profile's theme if it's already installed locally, and re-enables any captured plugin that's installed but currently disabled. See `scripts/check_environment.sh`.
+- When the profile's theme or a captured plugin isn't installed locally, the panel shows an install prompt (theme via `omarchy theme install <url>`, plugin via `omarchy plugin add <url> --enable --yes`) rather than silently skipping it - both are plain user-space git clones, so no elevated privileges are needed.
+- Added a "Check Shell Packages" action that scans for AUR-origin packages the Omarchy shell (core + installed plugins) shells out to but that aren't installed, via a copy of the standalone `omarchy-shell-aur-deps` command (`scripts/omarchy_shell_aur_deps.sh`). Installing needs root and there's no graphical polkit agent to prompt for it, so "Install in Terminal" opens Alacritty running the actual `yay`/`paru` command instead of trying (and failing) to do it silently in the background.
+- Added a "Copy" action per profile that copies its absolute file path to the clipboard (`wl-copy`), for sharing a snapshot with someone else.
+
+### Fixed
+
+- The save screen's popup card had a hand-tuned fixed height (`contentHeight: 220`) that didn't account for the new multiline notes field, so the Save/Cancel buttons could render partially outside the card's border. Both views' heights are now computed from their actual content (`Column.implicitHeight` plus the card's real border/padding inset) instead of a constant, so this can't drift out of sync again as content changes.
+
 ## [1.1.8] - 2026-09-22
 
 ### Added

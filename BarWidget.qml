@@ -26,6 +26,34 @@ Panel {
     property bool showingNameInput: false
     property var monitorMap: ({})
     property var _monitorsCaptured: []
+    property var _themeCaptured: null
+    property var _pluginsCaptured: []
+
+    // Sharing: capture/restore the current Omarchy theme and third-party
+    // shell plugins, so a profile shared onto another machine (or a fresh
+    // install) can offer to fetch whatever it's missing rather than
+    // silently landing in the wrong theme with plugins disabled.
+    readonly property string envCaptureScript: Qt.resolvedUrl("scripts/capture_environment.sh").toString().replace(/^file:\/\//, "")
+    readonly property string envCheckScript: Qt.resolvedUrl("scripts/check_environment.sh").toString().replace(/^file:\/\//, "")
+
+    // Path to the copied omarchy-shell-aur-deps script (scans the Omarchy
+    // shell + installed plugins for commands and reports which of their
+    // owning packages are AUR-origin), used by the "Check Shell Packages"
+    // action below.
+    readonly property string aurDepsScript: Qt.resolvedUrl("scripts/omarchy_shell_aur_deps.sh").toString().replace(/^file:\/\//, "")
+    property bool isCheckingPackages: false
+    property var missingPackages: []
+
+    // Set during restore (see checkEnvProc/buildAndRunRestore) when the
+    // profile's captured theme, or a third-party plugin it had enabled,
+    // isn't available locally - the UI shows an install prompt for each
+    // instead of silently skipping it.
+    property var missingTheme: null
+    property bool isInstallingTheme: false
+    property var missingPlugins: []
+    // Set by checkEnvProc for buildAndRunRestore to consume (see there).
+    property var _themeDecision: null
+    property var _pluginActions: []
 
     readonly property color hoverBg: bar
         ? Style.hoverFillFor(bar.foreground, Color.accent)
@@ -376,6 +404,57 @@ Panel {
         ]
     }
 
+    // --- Sharing: theme + third-party plugin capture/restore ---
+    // Mirrors the pure helpers in restoreLogic.mjs (see there for full doc).
+
+    function safePluginId(id) {
+        if (typeof id !== "string") return null
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) return null
+        return id
+    }
+
+    function computePluginActions(profilePlugins, currentPlugins) {
+        var byId = {}
+        if (Array.isArray(currentPlugins)) {
+            for (var i = 0; i < currentPlugins.length; i++) {
+                var p = currentPlugins[i]
+                if (p && typeof p.id === "string") byId[p.id] = p
+            }
+        }
+        var out = []
+        if (!Array.isArray(profilePlugins)) return out
+        for (var j = 0; j < profilePlugins.length; j++) {
+            var entry = profilePlugins[j]
+            if (!entry || typeof entry !== "object") continue
+            var id = root.safePluginId(entry.id)
+            if (id === null) continue
+            var repoUrl = typeof entry.repoUrl === "string" ? entry.repoUrl : ""
+            var cur = byId[id]
+            if (cur) {
+                out.push({ id: id, repoUrl: repoUrl, action: cur.enabled ? "none" : "enable" })
+            } else {
+                out.push({ id: id, repoUrl: repoUrl, action: "missing" })
+            }
+        }
+        return out
+    }
+
+    function parseAurDeps(output) {
+        var lines = typeof output === "string" ? output.split("\n") : []
+        var pkgs = []
+        var inSection = false
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i]
+            if (/^AUR \(foreign\) packages/.test(line)) { inSection = true; continue }
+            if (!inSection) continue
+            if (line.trim() === "") break
+            if (/none found/.test(line)) break
+            var m = line.match(/^\s*(\S+)/)
+            if (m) pkgs.push(m[1])
+        }
+        return pkgs
+    }
+
     function resolveExe(className) {
         return className.toLowerCase()
     }
@@ -443,7 +522,25 @@ Panel {
         bar: root.bar
         open: root.opened
         contentWidth: 280
-        contentHeight: showingNameInput ? 220 : 400
+        // KeyboardPanel's card is a fixed size (contentWidth x contentHeight,
+        // see /usr/share/omarchy/shell/Ui/KeyboardPanel.qml) - it does not
+        // auto-size to its content on its own. Bound here to whichever view's
+        // *implicitHeight* (Column always computes this from its children,
+        // independent of the anchors.fill that makes its actual displayed
+        // height follow this very property) is currently visible, plus two
+        // separate insets between contentHeight (= card.height) and where
+        // the Column's children actually get to paint: panel.
+        // verticalContentInset (the card's own border + padding, which
+        // contentHolder's anchors.margins subtracts before the Column ever
+        // sees its available space) and this Column's own 12px top/bottom
+        // anchors.margins on top of that. Missing the first of those is
+        // exactly what let the Save/Cancel buttons spill past the border
+        // the first time this was "fixed" (see CHANGELOG) - a hand-tuned
+        // constant had quietly been absorbing it. cappedContentHeight keeps
+        // the total from exceeding the screen.
+        contentHeight: panel.cappedContentHeight(
+            (showingNameInput ? nameInputColumn.implicitHeight : mainViewColumn.implicitHeight)
+            + panel.verticalContentInset + 24)
 
         PanelKeyCatcher {
             id: keyCatcher
@@ -452,6 +549,7 @@ Panel {
         }
 
         Column {
+            id: mainViewColumn
             anchors.fill: parent
             anchors.margins: 12
             spacing: 8
@@ -500,6 +598,174 @@ Panel {
                     enabled: !root.isRestoring && !root.isSnapshotting
                     onContainsMouseChanged: parent.color = containsMouse ? root.selectedBg : root.hoverBg
                     onClicked: root.doSnapshot()
+                }
+            }
+
+            // --- Sharing: environment check + missing-theme/plugin prompts ---
+
+            Rectangle {
+                width: parent.width
+                height: 32
+                radius: Style.cornerRadius
+                color: Qt.darker(Color.bar.background, 1.05)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.isCheckingPackages ? "Checking..." : "Check Shell Packages"
+                    color: Qt.darker(Color.bar.text, 1.2)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    hoverEnabled: true
+                    enabled: !root.isCheckingPackages
+                    onContainsMouseChanged: parent.color = containsMouse ? root.hoverBg : Qt.darker(Color.bar.background, 1.05)
+                    onClicked: root.doCheckPackages()
+                }
+            }
+
+            Rectangle {
+                visible: root.missingPackages.length > 0
+                width: parent.width
+                height: pkgCol.implicitHeight + 12
+                radius: Style.cornerRadius
+                color: "#4d3d1f"
+
+                Column {
+                    id: pkgCol
+                    anchors.fill: parent
+                    anchors.margins: 6
+                    spacing: 4
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: root.missingPackages.length + " AUR package(s) missing: " + root.missingPackages.join(", ")
+                        color: Color.bar.text
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 28
+                        radius: Style.cornerRadius
+                        color: root.hoverBg
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Install in Terminal"
+                            color: Color.bar.text
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.body
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
+                            onContainsMouseChanged: parent.color = containsMouse ? root.selectedBg : root.hoverBg
+                            onClicked: root.doInstallMissingPackages()
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                visible: root.missingTheme !== null
+                width: parent.width
+                height: themeCol.implicitHeight + 12
+                radius: Style.cornerRadius
+                color: "#4d3d1f"
+
+                Column {
+                    id: themeCol
+                    anchors.fill: parent
+                    anchors.margins: 6
+                    spacing: 4
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: "Theme missing: " + (root.missingTheme ? root.missingTheme.name : "")
+                        color: Color.bar.text
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 28
+                        radius: Style.cornerRadius
+                        color: root.isInstallingTheme ? Qt.darker(Color.bar.background, 1.15) : root.hoverBg
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.isInstallingTheme ? "Installing..." : (root.missingTheme && root.missingTheme.repoUrl.length > 0 ? "Install Theme" : "No source URL")
+                            color: Color.bar.text
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.body
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
+                            enabled: !root.isInstallingTheme && root.missingTheme && root.missingTheme.repoUrl.length > 0
+                            onContainsMouseChanged: parent.color = containsMouse ? root.selectedBg : root.hoverBg
+                            onClicked: root.doInstallMissingTheme()
+                        }
+                    }
+                }
+            }
+
+            Column {
+                width: parent.width
+                spacing: 4
+                visible: root.missingPlugins.length > 0
+
+                Repeater {
+                    model: root.missingPlugins
+
+                    delegate: Rectangle {
+                        width: parent.width
+                        height: 28
+                        radius: Style.cornerRadius
+                        color: "#4d3d1f"
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: 6
+                            spacing: 6
+
+                            Text {
+                                text: "Plugin missing: " + modelData.id
+                                color: Color.bar.text
+                                font.family: Style.font.family
+                                font.pixelSize: Style.font.body
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                text: modelData.repoUrl.length > 0 ? "Install" : "No URL"
+                                color: Color.bar.text
+                                font.family: Style.font.family
+                                font.pixelSize: Style.font.body
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    hoverEnabled: true
+                                    enabled: modelData.repoUrl.length > 0
+                                    onClicked: root.doInstallMissingPlugin(modelData)
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -562,6 +828,26 @@ Panel {
                                     }
                                 }
 
+                                // Copies this profile's absolute file path to
+                                // the clipboard (wl-copy) so it can be shared
+                                // (e.g. pasted into a chat) with someone else.
+                                Text {
+                                    text: "Copy"
+                                    color: Qt.darker(Color.bar.text, 1.4)
+                                    font.family: Style.font.family
+                                    font.pixelSize: Math.max(9, Style.font.body - 3)
+                                    Layout.alignment: Qt.AlignVCenter
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        hoverEnabled: true
+                                        enabled: !root.isRestoring && !root.isSnapshotting
+                                        onContainsMouseChanged: parent.color = containsMouse ? Color.bar.text : Qt.darker(Color.bar.text, 1.4)
+                                        onClicked: root.doCopyPath(modelData.name)
+                                    }
+                                }
+
                                 Text {
                                     text: "󰆴"
                                     color: Qt.darker(Color.bar.text, 1.4)
@@ -612,6 +898,7 @@ Panel {
         // --- Name Input View ---
 
         Column {
+            id: nameInputColumn
             anchors.fill: parent
             anchors.margins: 12
             spacing: 10
@@ -962,13 +1249,13 @@ Panel {
             snapTabsProc.running = true
         }
 
+        // Last step before assembling: capture the current Omarchy theme too,
+        // so restore can offer to reapply (or reinstall, if it's a
+        // user-installed one that's missing) it elsewhere. Runs last in the
+        // capture chain, not in parallel, so root._themeCaptured is always
+        // populated (or explicitly null on failure) before assemble() reads it.
         function finishNow() {
-            root.pendingSnapshot = snapTabsProc.assemble()
-            root.isSnapshotting = false
-            root.lastAction = "Captured " + snapTabsProc._windows.length + " windows"
-            saveNameField.text = generateDefaultName()
-            commentField.text = ""
-            root.showingNameInput = true
+            snapThemeProc.running = true
         }
 
         // Build pendingSnapshot, attaching parsed tab data onto windows.
@@ -992,7 +1279,9 @@ Panel {
             return {
                 "timestamp": Date.now(),
                 "windows": windows,
-                "monitors": root._monitorsCaptured || []
+                "monitors": root._monitorsCaptured || [],
+                "theme": root._themeCaptured,
+                "plugins": root._pluginsCaptured || []
             }
         }
 
@@ -1014,6 +1303,34 @@ Panel {
                 // Snapshot the monitors from the last stage (stored on root).
                 snapTabsProc._results = results
                 snapTabsProc.finishNow()
+            }
+        }
+    }
+
+    // Captures the current Omarchy theme (name + git origin, if it's a
+    // user-installed one) and the currently-enabled third-party shell
+    // plugins (id + git origin each), so a shared profile can be restored
+    // onto a machine missing either - see scripts/capture_environment.sh.
+    Process {
+        id: snapThemeProc
+        command: ["bash", root.envCaptureScript]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                try {
+                    var obj = JSON.parse(text)
+                    root._themeCaptured = (obj && obj.theme && obj.theme.name) ? obj.theme : null
+                    root._pluginsCaptured = (obj && Array.isArray(obj.plugins)) ? obj.plugins : []
+                } catch(e) {
+                    root._themeCaptured = null
+                    root._pluginsCaptured = []
+                }
+                root.pendingSnapshot = snapTabsProc.assemble()
+                root.isSnapshotting = false
+                root.lastAction = "Captured " + snapTabsProc._windows.length + " windows"
+                saveNameField.text = generateDefaultName()
+                commentField.text = ""
+                root.showingNameInput = true
             }
         }
     }
@@ -1080,6 +1397,8 @@ Panel {
         }
         root.isRestoring = true
         root.lastAction = "Restoring..."
+        root.missingTheme = null
+        root.missingPlugins = []
         restoreProc.command = ["python3", root.storeScript, "load", root.profileDir, safe]
         restoreProc.running = true
     }
@@ -1116,8 +1435,43 @@ Panel {
             root.lastAction = "Profile is empty"
             return
         }
-        checkExistingProc._profile = profile
-        checkExistingProc.running = true
+        checkEnvProc._profile = profile
+        var themeName = (profile.theme && typeof profile.theme.name === "string") ? profile.theme.name : ""
+        checkEnvProc.command = ["bash", root.envCheckScript, themeName]
+        checkEnvProc.running = true
+    }
+
+    // Restore-time counterpart to snapThemeProc: reports the current theme,
+    // whether the profile's captured theme is available locally, and the
+    // current third-party plugin list - see scripts/check_environment.sh.
+    // Feeds root._themeDecision/_pluginActions, which buildAndRunRestore
+    // reads to decide what to apply automatically vs. surface as a missing-
+    // theme/missing-plugin install prompt.
+    Process {
+        id: checkEnvProc
+        property var _profile: null
+        command: []
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var profile = checkEnvProc._profile
+                try {
+                    var env = JSON.parse(text)
+                    root._themeDecision = (profile.theme && profile.theme.name) ? {
+                        name: profile.theme.name,
+                        repoUrl: profile.theme.repoUrl || "",
+                        available: !!env.themeAvailable,
+                        alreadyCurrent: env.currentTheme === profile.theme.name
+                    } : null
+                    root._pluginActions = root.computePluginActions(profile.plugins, env.plugins)
+                } catch(e) {
+                    root._themeDecision = null
+                    root._pluginActions = []
+                }
+                checkExistingProc._profile = profile
+                checkExistingProc.running = true
+            }
+        }
     }
 
     Process {
@@ -1198,6 +1552,34 @@ Panel {
             lines.push("SAFETY_OWNED=0")
             lines.push("trap 'if [ \"$SAFETY_OWNED\" != \"1\" ]; then rm -rf \"$WSROOT\"; fi' EXIT")
             lines.push("echo \"[start] wsroot=$WSROOT profile_windows=" + profile.windows.length + " existing=" + (existing ? existing.length : 0) + "\" >> \"$LOGFILE\"")
+
+            // Phase -1: theme + third-party plugins (see checkEnvProc, which
+            // populated _themeDecision/_pluginActions just before this runs).
+            // Anything that can be applied locally with no network access
+            // (a theme already installed here, a plugin that's installed but
+            // disabled) is applied directly; anything that would need a
+            // fresh git clone is left alone and surfaced as an install
+            // prompt instead, since that's a user-initiated, network-
+            // touching action this plugin shouldn't take unprompted.
+            var td = root._themeDecision
+            if (td && !td.alreadyCurrent) {
+                if (td.available) {
+                    lines.push("omarchy theme set " + root.shellArg(td.name) + " >>\"$LOGFILE\" 2>&1 || true")
+                } else {
+                    root.missingTheme = { name: td.name, repoUrl: td.repoUrl }
+                }
+            }
+            var pluginActions = Array.isArray(root._pluginActions) ? root._pluginActions : []
+            var stillMissing = []
+            for (var pa = 0; pa < pluginActions.length; pa++) {
+                var act = pluginActions[pa]
+                if (act.action === "enable") {
+                    lines.push("omarchy plugin enable " + root.shellArg(act.id) + " >>\"$LOGFILE\" 2>&1 || true")
+                } else if (act.action === "missing") {
+                    stillMissing.push({ id: act.id, repoUrl: act.repoUrl })
+                }
+            }
+            root.missingPlugins = stillMissing
 
             // Phase 3/3b focus each spawn's target workspace in turn so the
             // new window lands there, which leaves whichever workspace was
@@ -1625,6 +2007,145 @@ Panel {
             root.lastAction = "Deleted"
             root.refreshProfiles()
             root.notify("Profile deleted", "")
+        }
+    }
+
+    // --- Sharing: copy a profile's path, check/install missing packages,
+    // install a missing theme or third-party plugin ---
+
+    function doCopyPath(name) {
+        var safe = root.sanitizeProfileName(name)
+        if (safe === null) return
+        var path = root.profileDir + "/" + safe + ".json"
+        copyPathProc._path = path
+        copyPathProc.command = ["wl-copy", path]
+        copyPathProc.running = true
+    }
+
+    Process {
+        id: copyPathProc
+        property string _path: ""
+        onExited: function(exitCode) {
+            if (exitCode === 0) {
+                root.lastAction = "Path copied"
+                root.notify("Snapshot path copied", copyPathProc._path)
+            } else {
+                root.lastAction = "Failed to copy path"
+                root.notify("Failed to copy path", "wl-copy is required")
+            }
+        }
+    }
+
+    function doCheckPackages() {
+        if (root.isCheckingPackages) return
+        root.isCheckingPackages = true
+        root.lastAction = "Checking shell packages..."
+        checkPackagesProc.command = ["bash", root.aurDepsScript]
+        checkPackagesProc.running = true
+    }
+
+    Process {
+        id: checkPackagesProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var pkgs = root.parseAurDeps(text)
+                root.missingPackages = pkgs
+                root.isCheckingPackages = false
+                if (pkgs.length === 0) {
+                    root.lastAction = "All shell packages are installed"
+                    root.notify("Shell packages", "Nothing missing")
+                } else {
+                    root.lastAction = pkgs.length + " missing package(s)"
+                    root.notify("Shell packages", pkgs.length + " AUR package(s) missing")
+                }
+            }
+        }
+    }
+
+    // Installing needs root (pacman/yay -S) and there's no graphical polkit
+    // agent registered, so a background Process could never supply the
+    // sudo password. Open a terminal instead - fully visible, interactive,
+    // same as running it by hand - rather than silently hang or fail.
+    function doInstallMissingPackages() {
+        if (root.missingPackages.length === 0) return
+        var pkgArgs = root.missingPackages.map(function(p) { return root.shellArg(p) }).join(" ")
+        var script = "H=$(command -v yay || command -v paru); " +
+            "if [ -z \"$H\" ]; then echo 'No AUR helper (yay/paru) found.'; " +
+            "else \"$H\" -S --needed " + pkgArgs + "; fi; " +
+            "echo; read -p 'Press Enter to close...' _"
+        Quickshell.execDetached(["alacritty", "-e", "bash", "-c", script])
+        root.lastAction = "Opened terminal to install packages"
+    }
+
+    function doInstallMissingTheme() {
+        if (!root.missingTheme || !root.missingTheme.repoUrl) {
+            root.lastAction = "No source URL for this theme"
+            return
+        }
+        root.isInstallingTheme = true
+        root.lastAction = "Installing theme..."
+        installThemeProc._theme = root.missingTheme
+        installThemeProc.command = ["omarchy", "theme", "install", root.missingTheme.repoUrl]
+        installThemeProc.running = true
+    }
+
+    // `omarchy theme install` (a plain git clone into ~/.config/omarchy/
+    // themes) needs no privileges, so unlike package installs this is safe
+    // to run directly from the widget.
+    Process {
+        id: installThemeProc
+        property var _theme: null
+        onExited: function(exitCode) {
+            root.isInstallingTheme = false
+            var theme = installThemeProc._theme
+            if (exitCode !== 0) {
+                root.lastAction = "Failed to install theme"
+                root.notify("Theme install failed", theme ? theme.name : "")
+                return
+            }
+            root.missingTheme = null
+            root.notify("Theme installed", theme ? theme.name : "")
+            if (theme && theme.name) {
+                applyThemeProc.command = ["omarchy", "theme", "set", theme.name]
+                applyThemeProc.running = true
+            }
+        }
+    }
+
+    Process {
+        id: applyThemeProc
+        onExited: function(exitCode) {
+            root.lastAction = exitCode === 0 ? "Theme applied" : "Theme installed, but could not apply"
+        }
+    }
+
+    function doInstallMissingPlugin(entry) {
+        if (!entry || !entry.repoUrl) {
+            root.lastAction = "No source URL for this plugin"
+            return
+        }
+        installPluginProc._entry = entry
+        installPluginProc.command = ["omarchy", "plugin", "add", entry.repoUrl, "--enable", "--yes"]
+        installPluginProc.running = true
+        root.lastAction = "Installing plugin " + entry.id + "..."
+    }
+
+    // Also a plain user-space git clone (~/.config/omarchy/plugins), no
+    // privileges needed - safe to run directly, same reasoning as the theme.
+    Process {
+        id: installPluginProc
+        property var _entry: null
+        onExited: function(exitCode) {
+            var entry = installPluginProc._entry
+            if (exitCode !== 0) {
+                root.lastAction = "Failed to install plugin"
+                root.notify("Plugin install failed", entry ? entry.id : "")
+                return
+            }
+            root.missingPlugins = root.missingPlugins.filter(function(e) { return !entry || e.id !== entry.id })
+            root.lastAction = "Plugin installed: " + (entry ? entry.id : "")
+            root.notify("Plugin installed", entry ? entry.id : "")
         }
     }
 

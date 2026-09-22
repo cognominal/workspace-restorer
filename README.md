@@ -14,6 +14,7 @@ An Omarchy shell plugin (Quickshell) for Hyprland that snapshots your window lay
 - **Layout Restoration** — Restores floating and fullscreen state for matched and spawned windows
 - **Window Grouping** — Captures which windows were tabbed together and reforms the same groups on restore (best-effort; most reliable for floating window groups)
 - **Snapshot Notes** — Add an optional multiline note when saving, shown as a preview under each profile in the list
+- **Sharing** — Snapshots capture your current Omarchy theme and enabled third-party plugins; restore applies what it can locally and offers to install whatever's missing (theme, plugins, or AUR packages the shell needs) so a shared profile can look and work right elsewhere. A "Copy" action per profile copies its file path for sharing.
 - **Desktop Notifications** — Feedback on snapshot/save/restore/delete actions
 
 ## Installation

@@ -26,6 +26,9 @@ import {
     groupMergeLines,
     sanitizeComment,
     MAX_COMMENT_LENGTH,
+    safePluginId,
+    computePluginActions,
+    parseAurDeps,
 } from "../restoreLogic.mjs"
 
 const DIR = "/home/user/.config/omarchy/workspace-restorer"
@@ -527,4 +530,71 @@ test("groupMergeLines accepts a shell variable address expression and indent", (
     assert.equal(lines[0], "    if [ -z \"${GRP0_ADDR:-}\" ]; then")
     assert.equal(lines[1], "      export GRP0_ADDR=\"$A\"")
     assert.ok(lines[4].includes("window='address:$A'"))
+})
+
+// --- safePluginId ---
+
+test("safePluginId accepts dotted plugin ids", () => {
+    assert.equal(safePluginId("davedes.workspace-restorer"), "davedes.workspace-restorer")
+    assert.equal(safePluginId("io.github.abdxdev.onscreen-keyboard"), "io.github.abdxdev.onscreen-keyboard")
+})
+
+test("safePluginId rejects unsafe/empty/oversized", () => {
+    assert.equal(safePluginId(""), null)
+    assert.equal(safePluginId(null), null)
+    assert.equal(safePluginId("a b"), null)
+    assert.equal(safePluginId("a;b"), null)
+    assert.equal(safePluginId("a".repeat(129)), null)
+})
+
+// --- computePluginActions ---
+
+test("computePluginActions: installed+enabled is none, installed+disabled is enable, absent is missing", () => {
+    const current = [
+        { id: "a.one", enabled: true },
+        { id: "a.two", enabled: false },
+    ]
+    const profile = [
+        { id: "a.one", repoUrl: "https://x/one.git" },
+        { id: "a.two", repoUrl: "https://x/two.git" },
+        { id: "a.three", repoUrl: "https://x/three.git" },
+    ]
+    const actions = computePluginActions(profile, current)
+    assert.deepEqual(actions, [
+        { id: "a.one", repoUrl: "https://x/one.git", action: "none" },
+        { id: "a.two", repoUrl: "https://x/two.git", action: "enable" },
+        { id: "a.three", repoUrl: "https://x/three.git", action: "missing" },
+    ])
+})
+
+test("computePluginActions drops entries with an invalid id and tolerates malformed input", () => {
+    assert.deepEqual(computePluginActions(null, []), [])
+    assert.deepEqual(computePluginActions([null, { id: "a b" }, { id: 5 }], []), [])
+    const ok = computePluginActions([{ id: "ok.one" }], [])
+    assert.deepEqual(ok, [{ id: "ok.one", repoUrl: "", action: "missing" }])
+})
+
+// --- parseAurDeps ---
+
+test("parseAurDeps extracts package names from the AUR section", () => {
+    const output = [
+        "AUR (foreign) packages providing commands the Omarchy shell launches:",
+        "  yay-pkg (somecmd)",
+        "  other-pkg (not installed, guessed by name — AUR)",
+        "",
+        "Official-repo packages (for reference):",
+        "  bash (bash)",
+    ].join("\n")
+    assert.deepEqual(parseAurDeps(output), ["yay-pkg", "other-pkg"])
+})
+
+test("parseAurDeps returns empty for the 'none found' placeholder", () => {
+    const output = "AUR (foreign) packages providing commands the Omarchy shell launches:\n  (none found — every resolvable command comes from an official repo)\n"
+    assert.deepEqual(parseAurDeps(output), [])
+})
+
+test("parseAurDeps tolerates malformed/empty input", () => {
+    assert.deepEqual(parseAurDeps(""), [])
+    assert.deepEqual(parseAurDeps(null), [])
+    assert.deepEqual(parseAurDeps("no matching header here"), [])
 })

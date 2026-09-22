@@ -313,3 +313,76 @@ export function buildBrowserLaunchCommands(pureCommand, cls, tabs) {
     return [base + " " + urls]
 }
 
+// --- Sharing: theme + third-party plugin capture/restore ---
+
+// Validate an Omarchy plugin id (e.g. "davedes.workspace-restorer",
+// "io.github.abdxdev.onscreen-keyboard") before it's embedded in a generated
+// `omarchy plugin enable <id>` command. Same charset as profile names minus
+// spaces - plugin ids are dotted identifiers, never freeform text.
+export function safePluginId(id) {
+    if (typeof id !== "string") return null
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) return null
+    return id
+}
+
+// Given the third-party plugins a snapshot captured ([{id, repoUrl}], from
+// whichever were enabled at capture time) and the live `omarchy plugin list
+// --json` output, decide what restore needs to do for each captured plugin:
+//   "none"    - already installed and enabled, nothing to do
+//   "enable"  - installed but currently disabled here, safe to flip on
+//               locally (no network) via `omarchy plugin enable <id>`
+//   "missing" - not installed here at all; needs repoUrl and an explicit
+//               user-initiated `omarchy plugin add <repoUrl> --enable --yes`
+// Entries with an invalid id, or that aren't plain objects, are dropped
+// rather than acted on. repoUrl is passed through as-is (never used to build
+// a shell command without going through shellArg first) so a missing/absent
+// one just means the install button has nothing to install from.
+export function computePluginActions(profilePlugins, currentPlugins) {
+    var byId = {}
+    if (Array.isArray(currentPlugins)) {
+        for (var i = 0; i < currentPlugins.length; i++) {
+            var p = currentPlugins[i]
+            if (p && typeof p.id === "string") byId[p.id] = p
+        }
+    }
+    var out = []
+    if (!Array.isArray(profilePlugins)) return out
+    for (var j = 0; j < profilePlugins.length; j++) {
+        var entry = profilePlugins[j]
+        if (!entry || typeof entry !== "object") continue
+        var id = safePluginId(entry.id)
+        if (id === null) continue
+        var repoUrl = typeof entry.repoUrl === "string" ? entry.repoUrl : ""
+        var cur = byId[id]
+        if (cur) {
+            out.push({ id: id, repoUrl: repoUrl, action: cur.enabled ? "none" : "enable" })
+        } else {
+            out.push({ id: id, repoUrl: repoUrl, action: "missing" })
+        }
+    }
+    return out
+}
+
+// Parse the stdout of scripts/omarchy_shell_aur_deps.sh (a copy of
+// ~/bin/omarchy-shell-aur-deps) into a bare list of AUR package names. Reads
+// only the "AUR (foreign) packages..." block the script always prints first
+// (its `-v` extra sections, if present, come after a blank line and are
+// ignored), stopping at the "(none found ...)" placeholder or the first
+// blank line. Each entry line is "pkgname (context)" - only the first token
+// is taken.
+export function parseAurDeps(output) {
+    var lines = typeof output === "string" ? output.split("\n") : []
+    var pkgs = []
+    var inSection = false
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i]
+        if (/^AUR \(foreign\) packages/.test(line)) { inSection = true; continue }
+        if (!inSection) continue
+        if (line.trim() === "") break
+        if (/none found/.test(line)) break
+        var m = line.match(/^\s*(\S+)/)
+        if (m) pkgs.push(m[1])
+    }
+    return pkgs
+}
+
